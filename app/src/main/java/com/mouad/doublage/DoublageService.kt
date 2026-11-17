@@ -54,6 +54,7 @@ class DoublageService : Service() {
     private var model: Model? = null
     private var traducteur: Translator? = null
     private var tts: TextToSpeech? = null
+    private var volume: Volume? = null
     private var fil: Thread? = null
     @Volatile private var actif = false
     private val enCours = ConcurrentHashMap.newKeySet<String>()
@@ -271,7 +272,8 @@ class DoublageService : Service() {
         val id = "u" + System.nanoTime()
         enCours.add(id)
         if (baisser) prendreFocus()
-        tt.speak(t, if (enRetard) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD, null, id)
+        val vol = (volume ?: Volume(this).also { volume = it }).params(prefs.getInt("volume", 100))
+        tt.speak(t, if (enRetard) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD, vol, id)
     }
 
     private fun finParole(id: String?) {
@@ -356,6 +358,7 @@ class DoublageService : Service() {
         projection = null
         tts?.stop()
         tts?.shutdown()
+        volume?.liberer()
         traducteur?.close()
         model?.close()
         if (::audio.isInitialized) rendreFocus()

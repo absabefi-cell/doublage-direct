@@ -52,6 +52,13 @@ object Analyse {
         else -> if (enfant) ENFANT else FEMME
     }
 
+    /** Volume de la synthèse (0..1) : la partie sous 100 %. */
+    fun volumeTts(pourcent: Int): Float = pourcent.coerceIn(0, 100) / 100f
+
+    /** Amplification en millibels pour la partie au-dessus de 100 % (300 % = +9,5 dB). */
+    fun gainMb(pourcent: Int): Int =
+        if (pourcent <= 100) 0 else (2000 * Math.log10(pourcent.coerceAtMost(300) / 100.0)).toInt()
+
     /** Faut-il traduire tout de suite la phrase en cours ? */
     fun couper(mots: Int, dureeMs: Long, maxMots: Int): Boolean =
         mots >= maxMots || (mots >= 3 && dureeMs > 3500)

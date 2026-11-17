@@ -35,6 +35,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var spHomme: Spinner
     private lateinit var spFemme: Spinner
     private var essai: TextToSpeech? = null
+    private var volEssai: Volume? = null
     private var voixDispo: List<Voice> = emptyList()
     private val prefs by lazy { getSharedPreferences(DoublageService.PREFS, MODE_PRIVATE) }
     private fun langue() = if (::rbArabe.isInitialized && rbArabe.isChecked) "ar" else "fr"
@@ -149,6 +150,14 @@ class MainActivity : ComponentActivity() {
         curseur("Hauteur de la voix", "hauteur", 60, 180, 100, { "x%.2f".format(it / 100f) }) {
             prefs.edit().putFloat("hauteur", it / 100f).apply()
         }
+        curseur("Volume de la traduction", "volume", 20, 300, 100,
+            { "$it %" + if (it > 100) " (amplifiée)" else "" }) {
+            prefs.edit().putInt("volume", it).apply()
+        }
+        col.addView(TextView(this).apply {
+            text = "Le son de YouTube se règle avec les boutons de volume du téléphone. La traduction suit ce volume, plus ce curseur."
+            textSize = 12f
+        })
         curseur("Réactivité (mots max avant de traduire)", "mots_max", 4, 16, 8,
             { "$it mots" + if (it <= 6) " (très rapide)" else if (it >= 12) " (phrases plus complètes)" else "" }) {
             prefs.edit().putInt("mots_max", it).apply()
@@ -203,6 +212,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         essai?.shutdown()
+        volEssai?.liberer()
         super.onDestroy()
     }
 
@@ -247,7 +257,8 @@ class MainActivity : ComponentActivity() {
         listOf("voix_homme_$l", "voix_femme_$l").forEachIndexed { i, cle ->
             val v = voixDispo.firstOrNull { it.name == prefs.getString(cle, null) }
             if (v != null) t.voice = v else t.language = if (l == "ar") Locale("ar") else Locale.FRENCH
-            t.speak(phrases[i], if (i == 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD, null, "t$i")
+            val vol = (volEssai ?: Volume(this).also { volEssai = it }).params(prefs.getInt("volume", 100))
+            t.speak(phrases[i], if (i == 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD, vol, "t$i")
         }
     }
 

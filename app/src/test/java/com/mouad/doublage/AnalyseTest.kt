@@ -62,6 +62,16 @@ class AnalyseTest {
         assertEquals(0f, Analyse.mediane(listOf(100f)))
     }
 
+    @Test fun volume() {
+        assertEquals(0.5f, Analyse.volumeTts(50))
+        assertEquals(1f, Analyse.volumeTts(250))
+        assertEquals(0, Analyse.gainMb(80))
+        assertEquals(0, Analyse.gainMb(100))
+        assertEquals(602, Analyse.gainMb(200))
+        assertEquals(954, Analyse.gainMb(300))
+        assertEquals(954, Analyse.gainMb(500))
+    }
+
     @Test fun coupure() {
         assertTrue(Analyse.couper(8, 500, 8))
         assertTrue(!Analyse.couper(5, 1000, 8))
