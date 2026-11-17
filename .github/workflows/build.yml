@@ -32,11 +32,26 @@ jobs:
           mv vosk-model-small-en-us-0.15 model-en-us
           cat /proc/sys/kernel/random/uuid > model-en-us/uuid
 
+      - name: Tests automatiques (si un test échoue, pas d'APK)
+        run: gradle testDebugUnitTest --no-daemon
+
+      - name: Vérification du code (lint)
+        run: gradle lintDebug --no-daemon
+
       - name: Compiler
         run: gradle assembleDebug --no-daemon
 
       - name: Renommer
         run: cp app/build/outputs/apk/debug/app-debug.apk Doublage-Direct-v${{ github.run_number }}.apk
+
+      - name: Rapport des tests
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rapports
+          path: |
+            app/build/reports/tests/
+            app/build/reports/lint-results-debug.html
 
       - uses: softprops/action-gh-release@v2
         with:

@@ -193,10 +193,10 @@ class DoublageService : Service() {
                 }
 
                 // Hauteur de la voix (pour choisir voix homme / femme / enfant)
-                hauteur(buf, n)?.let { if (hauteurs.size < 400) hauteurs.add(it) }
+                Analyse.hauteur(buf, n, TAUX)?.let { if (hauteurs.size < 400) hauteurs.add(it) }
 
                 if (reco.acceptWaveForm(buf, n)) {
-                    traiter(texte(reco.result, "text"), mediane(hauteurs))
+                    traiter(texte(reco.result, "text"), Analyse.mediane(hauteurs))
                     hauteurs.clear(); debutPhrase = 0L
                 } else {
                     // On coupe vite pour coller à la vidéo : trop de mots ou trop longtemps
@@ -206,8 +206,8 @@ class DoublageService : Service() {
                     if (debutPhrase == 0L) debutPhrase = maintenant
                     val mots = partiel.split(" ").size
                     val maxMots = prefs.getInt("mots_max", 8)
-                    if (mots >= maxMots || (mots >= 3 && maintenant - debutPhrase > 3500)) {
-                        traiter(texte(reco.finalResult, "text"), mediane(hauteurs))
+                    if (Analyse.couper(mots, maintenant - debutPhrase, maxMots)) {
+                        traiter(texte(reco.finalResult, "text"), Analyse.mediane(hauteurs))
                         reco.reset()
                         hauteurs.clear(); debutPhrase = 0L
                     }
@@ -226,36 +226,6 @@ class DoublageService : Service() {
         }
         return false
     }
-
-    // Fréquence fondamentale (Hz) d'un bloc, par autocorrélation. null si pas de voix nette.
-    private fun hauteur(buf: ByteArray, n: Int): Float? {
-        val nb = minOf(n / 2, 1024)
-        if (nb < 512) return null
-        val x = FloatArray(nb)
-        var energie = 0.0
-        for (i in 0 until nb) {
-            val v = ((buf[2 * i].toInt() and 0xFF) or (buf[2 * i + 1].toInt() shl 8)).toShort().toFloat()
-            x[i] = v; energie += v * v
-        }
-        if (energie / nb < 300.0 * 300.0) return null
-        val lmin = TAUX / 450   // 450 Hz max
-        val lmax = TAUX / 75    // 75 Hz min
-        var meilleur = 0.0; var lag = 0
-        for (l in lmin..lmax) {
-            var c = 0.0; var e1 = 0.0; var e2 = 0.0
-            var i = 0
-            while (i + l < nb) {
-                c += x[i] * x[i + l]; e1 += x[i] * x[i]; e2 += x[i + l] * x[i + l]
-                i++
-            }
-            val r = c / (Math.sqrt(e1 * e2) + 1e-9)
-            if (r > meilleur) { meilleur = r; lag = l }
-        }
-        return if (meilleur > 0.6 && lag > 0) TAUX.toFloat() / lag else null
-    }
-
-    private fun mediane(l: List<Float>): Float =
-        if (l.size < 3) 0f else l.sorted()[l.size / 2]
 
     private fun texte(json: String, cle: String): String =
         try { JSONObject(json).optString(cle).trim() } catch (e: Exception) { "" }
@@ -276,13 +246,10 @@ class DoublageService : Service() {
         }
     }
 
-    // 0 = homme, 1 = femme, 2 = enfant
-    private fun genre(f0: Float): Int = when {
-        f0 <= 0f -> if (prefs.getInt("defaut", 0) == 1) 1 else 0
-        f0 < prefs.getInt("seuil_femme", 165) -> 0
-        f0 < prefs.getInt("seuil_enfant", 290) -> 1
-        else -> if (prefs.getBoolean("enfant", true)) 2 else 1
-    }
+    private fun genre(f0: Float): Int = Analyse.genre(
+        f0, prefs.getInt("seuil_femme", 165), prefs.getInt("seuil_enfant", 290),
+        prefs.getBoolean("enfant", true), prefs.getInt("defaut", 0)
+    )
 
     private fun parler(t: String, f0: Float) {
         val tt = tts ?: return

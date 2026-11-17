@@ -29,6 +29,12 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
+
+    lint {
+        abortOnError = true
+        checkReleaseBuilds = false
+        disable += setOf("MissingTranslation", "SetTextI18n", "InvalidPackage", "GradleDependency", "OldTargetApi")
+    }
 }
 
 dependencies {
@@ -36,4 +42,5 @@ dependencies {
     implementation("com.google.mlkit:translate:17.0.3")
     implementation("com.alphacephei:vosk-android:0.3.47@aar")
     implementation("net.java.dev.jna:jna:5.13.0@aar")
+    testImplementation("junit:junit:4.13.2")
 }
