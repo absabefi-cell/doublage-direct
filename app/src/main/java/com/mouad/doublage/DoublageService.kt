@@ -33,7 +33,7 @@ import org.vosk.Model
 import org.vosk.Recognizer
 import org.vosk.android.StorageService
 import java.util.Locale
-import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.ConcurrentHashMap
 
 class DoublageService : Service() {
 
@@ -45,6 +45,7 @@ class DoublageService : Service() {
         @Volatile var dOriginal = ""
         @Volatile var dTraduction = ""
         var ecouteur: (() -> Unit)? = null
+        const val PREFS = "reglages"
     }
 
     private val principal = Handler(Looper.getMainLooper())
@@ -55,7 +56,8 @@ class DoublageService : Service() {
     private var tts: TextToSpeech? = null
     private var fil: Thread? = null
     @Volatile private var actif = false
-    private val enAttente = AtomicInteger(0)
+    private val enCours = ConcurrentHashMap.newKeySet<String>()
+    private val prefs by lazy { getSharedPreferences(PREFS, MODE_PRIVATE) }
     private lateinit var audio: AudioManager
     private var focus: AudioFocusRequest? = null
     private var baisser = true
@@ -112,9 +114,10 @@ class DoublageService : Service() {
             tts?.setAudioAttributes(attributsParole())
             tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(id: String?) {}
-                override fun onDone(id: String?) { finParole() }
+                override fun onDone(id: String?) { finParole(id) }
+                override fun onStop(id: String?, interrupted: Boolean) { finParole(id) }
                 @Deprecated("Deprecated in Java")
-                override fun onError(id: String?) { finParole() }
+                override fun onError(id: String?) { finParole(id) }
             })
         }
 
@@ -174,6 +177,8 @@ class DoublageService : Service() {
             val buf = ByteArray(4096)
             var dernierSon = System.currentTimeMillis()
             var averti = false
+            var debutPhrase = 0L
+            val hauteurs = ArrayList<Float>()
             while (actif) {
                 val n = rec.read(buf, 0, buf.size)
                 if (n <= 0) continue
@@ -187,14 +192,24 @@ class DoublageService : Service() {
                     statut("Aucun son capté depuis 20 s. Vidéo en pause, ou l'app bloque la capture.")
                 }
 
+                // Hauteur de la voix (pour choisir voix homme / femme / enfant)
+                hauteur(buf, n)?.let { if (hauteurs.size < 400) hauteurs.add(it) }
+
                 if (reco.acceptWaveForm(buf, n)) {
-                    traiter(texte(reco.result, "text"))
+                    traiter(texte(reco.result, "text"), mediane(hauteurs))
+                    hauteurs.clear(); debutPhrase = 0L
                 } else {
-                    // Phrase trop longue sans pause : on coupe pour ne pas prendre de retard
+                    // On coupe vite pour coller à la vidéo : trop de mots ou trop longtemps
                     val partiel = texte(reco.partialResult, "partial")
-                    if (partiel.split(" ").size >= 16) {
-                        traiter(texte(reco.finalResult, "text"))
+                    if (partiel.isEmpty()) continue
+                    val maintenant = System.currentTimeMillis()
+                    if (debutPhrase == 0L) debutPhrase = maintenant
+                    val mots = partiel.split(" ").size
+                    val maxMots = prefs.getInt("mots_max", 8)
+                    if (mots >= maxMots || (mots >= 3 && maintenant - debutPhrase > 3500)) {
+                        traiter(texte(reco.finalResult, "text"), mediane(hauteurs))
                         reco.reset()
+                        hauteurs.clear(); debutPhrase = 0L
                     }
                 }
             }
@@ -212,12 +227,42 @@ class DoublageService : Service() {
         return false
     }
 
+    // Fréquence fondamentale (Hz) d'un bloc, par autocorrélation. null si pas de voix nette.
+    private fun hauteur(buf: ByteArray, n: Int): Float? {
+        val nb = minOf(n / 2, 1024)
+        if (nb < 512) return null
+        val x = FloatArray(nb)
+        var energie = 0.0
+        for (i in 0 until nb) {
+            val v = ((buf[2 * i].toInt() and 0xFF) or (buf[2 * i + 1].toInt() shl 8)).toShort().toFloat()
+            x[i] = v; energie += v * v
+        }
+        if (energie / nb < 300.0 * 300.0) return null
+        val lmin = TAUX / 450   // 450 Hz max
+        val lmax = TAUX / 75    // 75 Hz min
+        var meilleur = 0.0; var lag = 0
+        for (l in lmin..lmax) {
+            var c = 0.0; var e1 = 0.0; var e2 = 0.0
+            var i = 0
+            while (i + l < nb) {
+                c += x[i] * x[i + l]; e1 += x[i] * x[i]; e2 += x[i + l] * x[i + l]
+                i++
+            }
+            val r = c / (Math.sqrt(e1 * e2) + 1e-9)
+            if (r > meilleur) { meilleur = r; lag = l }
+        }
+        return if (meilleur > 0.6 && lag > 0) TAUX.toFloat() / lag else null
+    }
+
+    private fun mediane(l: List<Float>): Float =
+        if (l.size < 3) 0f else l.sorted()[l.size / 2]
+
     private fun texte(json: String, cle: String): String =
         try { JSONObject(json).optString(cle).trim() } catch (e: Exception) { "" }
 
     // ---------- Traduction et parole ----------
 
-    private fun traiter(t: String) {
+    private fun traiter(t: String, f0: Float) {
         if (t.length < 3 || t == "the" || t == "huh") return
         dOriginal = t
         signaler()
@@ -226,24 +271,45 @@ class DoublageService : Service() {
                 dTraduction = tr
                 notifier(tr)
                 signaler()
-                parler(tr)
+                parler(tr, f0)
             }
         }
     }
 
-    private fun parler(t: String) {
-        val enRetard = enAttente.get() >= 2
-        if (enRetard) enAttente.set(0)
-        enAttente.incrementAndGet()
-        if (baisser) prendreFocus()
-        tts?.speak(t, if (enRetard) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD, null, "u" + System.nanoTime())
+    // 0 = homme, 1 = femme, 2 = enfant
+    private fun genre(f0: Float): Int = when {
+        f0 <= 0f -> if (prefs.getInt("defaut", 0) == 1) 1 else 0
+        f0 < prefs.getInt("seuil_femme", 165) -> 0
+        f0 < prefs.getInt("seuil_enfant", 290) -> 1
+        else -> if (prefs.getBoolean("enfant", true)) 2 else 1
     }
 
-    private fun finParole() {
-        if (enAttente.decrementAndGet() <= 0) {
-            enAttente.set(0)
-            principal.post { rendreFocus() }
-        }
+    private fun parler(t: String, f0: Float) {
+        val tt = tts ?: return
+        // Retard : s'il reste déjà 2 phrases à dire, on les saute pour rattraper la vidéo
+        val enRetard = enCours.size >= 2
+        if (enRetard) enCours.clear()
+
+        val g = if (prefs.getBoolean("auto", true)) genre(f0) else prefs.getInt("defaut", 0)
+        val nomVoix = prefs.getString(if (g == 0) "voix_homme_$langue" else "voix_femme_$langue", null)
+        val v = tt.voices?.firstOrNull { it.name == nomVoix }
+        if (v != null) tt.voice = v else tt.language = if (langue == "ar") Locale("ar") else Locale.FRENCH
+
+        // Vitesse : réglage de base + accélération si on prend du retard
+        val base = prefs.getFloat("vitesse", 1.2f)
+        tt.setSpeechRate(minOf(base * (1f + 0.25f * enCours.size), 2.5f))
+        val h = prefs.getFloat("hauteur", 1.0f)
+        tt.setPitch(if (g == 2) h * 1.4f else h)
+
+        val id = "u" + System.nanoTime()
+        enCours.add(id)
+        if (baisser) prendreFocus()
+        tt.speak(t, if (enRetard) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD, null, id)
+    }
+
+    private fun finParole(id: String?) {
+        if (id != null) enCours.remove(id)
+        if (enCours.isEmpty()) principal.post { if (enCours.isEmpty()) rendreFocus() }
     }
 
     private fun attributsParole() = AudioAttributes.Builder()
