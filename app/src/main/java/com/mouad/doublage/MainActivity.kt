@@ -5,40 +5,51 @@ import android.content.Intent
 import android.graphics.Color
 import android.graphics.Typeface
 import android.media.projection.MediaProjectionManager
+import android.net.Uri
 import android.os.Bundle
+import android.provider.Settings
 import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.speech.tts.Voice
-import android.widget.AdapterView
-import android.widget.ArrayAdapter
-import android.widget.SeekBar
-import android.widget.Spinner
-import java.util.Locale
 import android.view.Gravity
 import android.view.View
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.LinearLayout
-import android.widget.RadioButton
-import android.widget.RadioGroup
 import android.widget.ScrollView
+import android.widget.Spinner
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
+import java.io.File
+import java.util.Locale
 
 class MainActivity : ComponentActivity() {
 
     private lateinit var statut: TextView
     private lateinit var original: TextView
     private lateinit var traduction: TextView
-    private lateinit var rbArabe: RadioButton
     private lateinit var cbBaisser: CheckBox
+    private lateinit var spSource: Spinner
+    private lateinit var spCible: Spinner
     private lateinit var spHomme: Spinner
     private lateinit var spFemme: Spinner
+    private lateinit var triVoix: TextView
+    private lateinit var btBulle: Button
     private var essai: TextToSpeech? = null
     private var volEssai: Volume? = null
-    private var voixDispo: List<Voice> = emptyList()
+    private var voixToutes: List<Voice> = emptyList()
+    private var voixHommes: List<Voice> = emptyList()
+    private var voixFemmes: List<Voice> = emptyList()
+    private val aTrier = ArrayDeque<Voice>()
+    private var triEnCours = false
     private val prefs by lazy { getSharedPreferences(DoublageService.PREFS, MODE_PRIVATE) }
-    private fun langue() = if (::rbArabe.isInitialized && rbArabe.isChecked) "ar" else "fr"
+
+    private fun source() = prefs.getString("source", "en") ?: "en"
+    private fun cible() = prefs.getString("cible", "fr") ?: "fr"
+    private fun locale(): Locale = Locale.forLanguageTag(Langues.codeVoix(cible()))
 
     private val demandePermissions =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { res ->
@@ -52,7 +63,8 @@ class MainActivity : ComponentActivity() {
                 val i = Intent(this, DoublageService::class.java).apply {
                     putExtra("code", r.resultCode)
                     putExtra("data", r.data)
-                    putExtra("langue", if (rbArabe.isChecked) "ar" else "fr")
+                    putExtra("source", source())
+                    putExtra("cible", cible())
                     putExtra("baisser", cbBaisser.isChecked)
                 }
                 startForegroundService(i)
@@ -71,6 +83,11 @@ class MainActivity : ComponentActivity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(20), dp(28), dp(20), dp(20))
         }
+        fun titre(t: String) = col.addView(TextView(this).apply {
+            text = t; textSize = 18f; setTypeface(null, Typeface.BOLD)
+            setPadding(0, dp(18), 0, dp(4))
+        })
+        fun petit(t: String) = TextView(this).apply { text = t; textSize = 14f; setPadding(0, dp(6), 0, 0) }
 
         col.addView(TextView(this).apply {
             text = "Doublage Direct"
@@ -79,93 +96,79 @@ class MainActivity : ComponentActivity() {
             setTextColor(Color.parseColor("#1B7F4B"))
         })
         col.addView(TextView(this).apply {
-            text = "Anglais → traduction parlée, sans serveur"
+            text = "Toutes les langues → traduction parlée, sans serveur"
             textSize = 14f
-            setPadding(0, dp(2), 0, dp(18))
+            setPadding(0, dp(2), 0, dp(10))
         })
 
-        col.addView(TextView(this).apply { text = "Langue de la traduction"; textSize = 16f })
-        val groupe = RadioGroup(this).apply { orientation = RadioGroup.HORIZONTAL }
-        val rbFr = RadioButton(this).apply { text = "Français"; id = View.generateViewId() }
-        rbArabe = RadioButton(this).apply { text = "العربية"; id = View.generateViewId() }
-        groupe.addView(rbFr); groupe.addView(rbArabe)
-        groupe.check(if (prefs.getString("langue", "fr") == "ar") rbArabe.id else rbFr.id)
-        groupe.setOnCheckedChangeListener { _, _ ->
-            prefs.edit().putString("langue", langue()).apply()
-            remplirVoix()
-        }
-        col.addView(groupe)
+        // ---------- Langues ----------
+        titre("Langues")
+        col.addView(petit("Langue de la vidéo"))
+        spSource = Spinner(this); col.addView(spSource)
+        col.addView(petit("Langue de la traduction"))
+        spCible = Spinner(this); col.addView(spCible)
+        lierLangues()
 
         cbBaisser = CheckBox(this).apply {
             text = "Baisser le son de YouTube pendant la traduction"
-            isChecked = true
+            isChecked = prefs.getBoolean("baisser", true)
+            setOnCheckedChangeListener { _, b -> prefs.edit().putBoolean("baisser", b).apply() }
         }
         col.addView(cbBaisser)
 
-        // ---------- Réglage des voix ----------
-        col.addView(TextView(this).apply {
-            text = "Voix"; textSize = 18f; setTypeface(null, Typeface.BOLD)
-            setPadding(0, dp(18), 0, dp(4))
-        })
-        col.addView(TextView(this).apply { text = "Voix homme"; textSize = 14f })
+        // ---------- Voix ----------
+        titre("Voix")
+        col.addView(petit("Voix homme (garçon = même voix, plus aiguë)"))
         spHomme = Spinner(this); col.addView(spHomme)
-        col.addView(TextView(this).apply { text = "Voix femme"; textSize = 14f; setPadding(0, dp(8), 0, 0) })
+        col.addView(Button(this).apply {
+            text = "Cette voix est une femme ↓"
+            setOnClickListener { corriger(spHomme, voixHommes, Analyse.FEMME) }
+        })
+        col.addView(petit("Voix femme (fille = même voix, plus aiguë)"))
         spFemme = Spinner(this); col.addView(spFemme)
+        col.addView(Button(this).apply {
+            text = "Cette voix est un homme ↑"
+            setOnClickListener { corriger(spFemme, voixFemmes, Analyse.HOMME) }
+        })
+        triVoix = TextView(this).apply { textSize = 12f; setTypeface(null, Typeface.ITALIC) }
+        col.addView(triVoix)
 
         col.addView(CheckBox(this).apply {
-            text = "Choisir homme / femme automatiquement selon la voix du film"
+            text = "Choisir la voix automatiquement selon le personnage du film"
             isChecked = prefs.getBoolean("auto", true)
             setOnCheckedChangeListener { _, b -> prefs.edit().putBoolean("auto", b).apply() }
         })
-        col.addView(CheckBox(this).apply {
-            text = "Voix d'enfant (voix femme plus aiguë) pour les voix très aiguës"
-            isChecked = prefs.getBoolean("enfant", true)
-            setOnCheckedChangeListener { _, b -> prefs.edit().putBoolean("enfant", b).apply() }
+        col.addView(petit("Voix des enfants"))
+        val choixEnfants = listOf(
+            "Pas de voix d'enfant", "Auto (garçon ou fille, estimation)",
+            "Toujours garçon", "Toujours fille"
+        )
+        col.addView(Spinner(this).apply {
+            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, choixEnfants)
+            setSelection(prefs.getInt("enfants", Analyse.ENFANTS_AUTO))
+            onItemSelectedListener = choix { prefs.edit().putInt("enfants", it).apply() }
         })
 
-        fun curseur(titre: String, cle: String, lo: Int, hi: Int, defaut: Int, affiche: (Int) -> String,
-                    sauver: (Int) -> Unit) {
-            val lbl = TextView(this).apply { textSize = 14f; setPadding(0, dp(10), 0, 0) }
-            col.addView(lbl)
-            val sb = SeekBar(this).apply { max = hi - lo }
-            val depart = when (cle) {
-                "vitesse" -> (prefs.getFloat(cle, defaut / 100f) * 100).toInt()
-                "hauteur" -> (prefs.getFloat(cle, defaut / 100f) * 100).toInt()
-                else -> prefs.getInt(cle, defaut)
-            }
-            sb.progress = depart - lo
-            lbl.text = "$titre : ${affiche(depart)}"
-            sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) {
-                    lbl.text = "$titre : ${affiche(p + lo)}"; sauver(p + lo)
-                }
-                override fun onStartTrackingTouch(s: SeekBar?) {}
-                override fun onStopTrackingTouch(s: SeekBar?) {}
-            })
-            col.addView(sb)
-        }
-        curseur("Vitesse de la voix", "vitesse", 60, 250, 120, { "x%.2f".format(it / 100f) }) {
-            prefs.edit().putFloat("vitesse", it / 100f).apply()
-        }
-        curseur("Hauteur de la voix", "hauteur", 60, 180, 100, { "x%.2f".format(it / 100f) }) {
-            prefs.edit().putFloat("hauteur", it / 100f).apply()
-        }
-        curseur("Volume de la traduction", "volume", 20, 300, 100,
-            { "$it %" + if (it > 100) " (amplifiée)" else "" }) {
-            prefs.edit().putInt("volume", it).apply()
-        }
+        // ---------- Réglages (aussi dans le bouton ⋮ par-dessus YouTube) ----------
+        titre("Réglages")
+        Reglages.ajouter(this, col, prefs, complet = true)
         col.addView(TextView(this).apply {
-            text = "Les boutons de volume du téléphone règlent tout. Ces deux curseurs règlent l'équilibre entre la vidéo et la traduction."
+            text = "Les boutons de volume du téléphone règlent tout. Les curseurs de volume règlent l'équilibre entre la vidéo et la traduction."
             textSize = 12f
         })
-        curseur("Volume de YouTube pendant la traduction", "volume_original", 10, 100, 40,
-            { "$it %" + if (it >= 100) " (pas baissé)" else "" }) {
-            prefs.edit().putInt("volume_original", it).apply()
+
+        col.addView(CheckBox(this).apply {
+            text = "Bouton ⋮ par-dessus YouTube pour régler sans arrêter"
+            isChecked = prefs.getBoolean("bulle", true)
+            setOnCheckedChangeListener { _, b -> prefs.edit().putBoolean("bulle", b).apply(); majBulle() }
+        })
+        btBulle = Button(this).apply {
+            text = "Autoriser le bouton ⋮ (afficher par-dessus les autres applis)"
+            setOnClickListener {
+                startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+            }
         }
-        curseur("Réactivité (mots max avant de traduire)", "mots_max", 4, 16, 8,
-            { "$it mots" + if (it <= 6) " (très rapide)" else if (it >= 12) " (phrases plus complètes)" else "" }) {
-            prefs.edit().putInt("mots_max", it).apply()
-        }
+        col.addView(btBulle)
 
         col.addView(Button(this).apply {
             text = "Tester les voix"
@@ -194,7 +197,7 @@ class MainActivity : ComponentActivity() {
         col.addView(statut)
 
         col.addView(TextView(this).apply {
-            text = "Entendu (anglais)"; textSize = 13f; setPadding(0, dp(20), 0, dp(4))
+            text = "Entendu"; textSize = 13f; setPadding(0, dp(20), 0, dp(4))
         })
         original = TextView(this).apply { textSize = 16f }
         col.addView(original)
@@ -211,7 +214,39 @@ class MainActivity : ComponentActivity() {
 
         setContentView(ScrollView(this).apply { addView(col) })
 
-        essai = TextToSpeech(this) { st -> if (st == TextToSpeech.SUCCESS) remplirVoix() }
+        essai = TextToSpeech(this) { st ->
+            if (st != TextToSpeech.SUCCESS) return@TextToSpeech
+            essai?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                override fun onStart(id: String?) {}
+                override fun onDone(id: String?) { finTri(id, true) }
+                override fun onStop(id: String?, interrupted: Boolean) { finTri(id, false) }
+                @Deprecated("Deprecated in Java")
+                override fun onError(id: String?) { finTri(id, false) }
+            })
+            runOnUiThread { remplirVoix() }
+        }
+    }
+
+    private fun choix(f: (Int) -> Unit) = object : AdapterView.OnItemSelectedListener {
+        override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) = f(pos)
+        override fun onNothingSelected(p: AdapterView<*>?) {}
+    }
+
+    private fun lierLangues() {
+        val src = Langues.sources
+        spSource.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, src.map { Langues.etiquetteSource(it) })
+        spSource.setSelection(src.indexOfFirst { it.code == source() }.coerceAtLeast(0))
+        spSource.onItemSelectedListener = choix { prefs.edit().putString("source", src[it].code).apply() }
+
+        val tous = Langues.toutes
+        spCible.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, tous.map { it.nom })
+        spCible.setSelection(tous.indexOfFirst { it.code == cible() }.coerceAtLeast(0))
+        spCible.onItemSelectedListener = choix {
+            if (tous[it].code != cible()) {
+                prefs.edit().putString("cible", tous[it].code).apply()
+                remplirVoix()
+            }
+        }
     }
 
     override fun onDestroy() {
@@ -220,56 +255,125 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
     }
 
+    // ---------- Listes de voix : hommes à part, femmes à part ----------
+
+    /** Genre d'une voix : correction à la main, sinon mesure de sa hauteur, sinon null (pas encore triée). */
+    private fun genreVoix(v: Voice): Int? {
+        val corr = prefs.getInt("gv_${v.name}", -1)
+        if (corr >= 0) return corr
+        val f0 = prefs.getFloat("f0v_${v.name}", 0f)
+        return Analyse.genreVoix(if (f0 > 0f) f0 else null)
+    }
+
     private fun nomAffiche(v: Voice, i: Int): String {
         val pays = v.locale.displayCountry.ifBlank { v.locale.country }
         val net = if (v.isNetworkConnectionRequired) " (Internet)" else ""
-        return "Voix ${i + 1} - $pays - ${v.name}$net"
+        val doute = if (genreVoix(v) == null) " (?)" else ""
+        return "Voix ${i + 1} - $pays - ${v.name}$net$doute"
     }
 
     private fun remplirVoix() {
         val t = essai ?: return
-        val l = langue()
-        voixDispo = (t.voices ?: emptySet())
-            .filter { it.locale.language == l && it.features?.contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED) != true }
+        val l = cible()
+        val lang = locale().language
+        voixToutes = (t.voices ?: emptySet())
+            .filter { it.locale.language == lang && it.features?.contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED) != true }
             .sortedWith(compareBy({ it.isNetworkConnectionRequired }, { it.name }))
-        val noms = listOf("Par défaut") + voixDispo.mapIndexed { i, v -> nomAffiche(v, i) }
-        fun lier(sp: Spinner, cle: String) {
+        // Une voix pas encore triée apparaît dans les deux listes
+        voixHommes = voixToutes.filter { genreVoix(it) != Analyse.FEMME }
+        voixFemmes = voixToutes.filter { genreVoix(it) != Analyse.HOMME }
+
+        fun lier(sp: Spinner, liste: List<Voice>, cle: String) {
+            val noms = listOf("Par défaut") + liste.mapIndexed { i, v -> nomAffiche(v, i) }
             sp.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, noms)
-            val sel = voixDispo.indexOfFirst { it.name == prefs.getString(cle, null) }
+            val sel = liste.indexOfFirst { it.name == prefs.getString(cle, null) }
             sp.setSelection(if (sel >= 0) sel + 1 else 0)
-            sp.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-                override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
-                    prefs.edit().putString(cle, if (pos == 0) null else voixDispo[pos - 1].name).apply()
-                }
-                override fun onNothingSelected(p: AdapterView<*>?) {}
+            sp.onItemSelectedListener = choix { pos ->
+                prefs.edit().putString(cle, if (pos == 0) null else liste[pos - 1].name).apply()
             }
         }
-        lier(spHomme, "voix_homme_$l")
-        lier(spFemme, "voix_femme_$l")
-        if (voixDispo.isEmpty()) statut.text =
-            "Aucune voix ${if (l == "ar") "arabe" else "française"} installée : Paramètres > Synthèse vocale > Google > Installer les données vocales."
+        lier(spHomme, voixHommes, "voix_homme_$l")
+        lier(spFemme, voixFemmes, "voix_femme_$l")
+        if (voixToutes.isEmpty()) statut.text =
+            "Aucune voix ${Langues.trouver(l).nom} installée : Paramètres > Synthèse vocale > Google > Installer les données vocales."
+        lancerTri()
+    }
+
+    /** La voix choisie est mal classée : on la déplace dans l'autre liste. */
+    private fun corriger(sp: Spinner, liste: List<Voice>, nouveau: Int) {
+        val pos = sp.selectedItemPosition
+        if (pos <= 0) { statut.text = "Choisis d'abord une voix dans la liste."; return }
+        val v = liste[pos - 1]
+        val l = cible()
+        val cleAvant = if (nouveau == Analyse.FEMME) "voix_homme_$l" else "voix_femme_$l"
+        prefs.edit().putInt("gv_${v.name}", nouveau).remove(cleAvant).apply()
+        statut.text = "${v.name} déplacée dans les voix ${if (nouveau == Analyse.FEMME) "femme" else "homme"}."
+        remplirVoix()
+    }
+
+    /** Chaque voix parle une fois en silence (dans un fichier) : on mesure si elle est grave ou aiguë. */
+    private fun lancerTri() {
+        aTrier.clear()
+        aTrier.addAll(voixToutes.filter { prefs.getFloat("f0v_${it.name}", 0f) == 0f && prefs.getInt("gv_${it.name}", -1) < 0 })
+        if (!triEnCours) trierSuivante()
+    }
+
+    private fun fichierTri() = File(cacheDir, "tri_voix.wav")
+
+    private fun trierSuivante() {
+        val t = essai ?: return
+        val v = aTrier.removeFirstOrNull()
+        if (v == null) {
+            if (triEnCours) { triEnCours = false; triVoix.text = "Voix triées : hommes et femmes séparés."; remplirVoix() }
+            return
+        }
+        triEnCours = true
+        triVoix.text = "Tri des voix homme / femme... (${aTrier.size + 1} restantes)"
+        t.voice = v
+        t.setPitch(1f); t.setSpeechRate(1f)
+        val r = t.synthesizeToFile("1 2 3 4 5 6 7 8 9 10", Bundle(), fichierTri(), "tri:${v.name}")
+        if (r != TextToSpeech.SUCCESS) { prefs.edit().putFloat("f0v_${v.name}", -1f).apply(); trierSuivante() }
+    }
+
+    private fun finTri(id: String?, ok: Boolean) {
+        if (id == null || !id.startsWith("tri:")) return
+        val nom = id.removePrefix("tri:")
+        val f0 = if (ok) try { Analyse.hauteurWav(fichierTri().readBytes()) } catch (_: Exception) { null } else null
+        prefs.edit().putFloat("f0v_$nom", f0 ?: -1f).apply()
+        runOnUiThread { trierSuivante() }
     }
 
     private fun tester() {
         val t = essai ?: return
-        val l = langue()
-        t.language = if (l == "ar") Locale("ar") else Locale.FRENCH
+        val l = cible()
         t.setSpeechRate(prefs.getFloat("vitesse", 1.2f))
-        t.setPitch(prefs.getFloat("hauteur", 1.0f))
-        val phrases = if (l == "ar") listOf("مرحبا، هذا صوت الرجل.", "وهذا صوت المرأة.")
-                      else listOf("Bonjour, voici la voix d'homme.", "Et voici la voix de femme.")
-        listOf("voix_homme_$l", "voix_femme_$l").forEachIndexed { i, cle ->
-            val v = voixDispo.firstOrNull { it.name == prefs.getString(cle, null) }
-            if (v != null) t.voice = v else t.language = if (l == "ar") Locale("ar") else Locale.FRENCH
+        val phrases = when (l) {
+            "ar" -> listOf("مرحبا، هذا صوت الرجل.", "وهذا صوت المرأة.", "وهذا صوت الولد.", "وهذا صوت البنت.")
+            "fr" -> listOf("Bonjour, voici la voix d'homme.", "Et voici la voix de femme.", "Voici le garçon.", "Et voici la fille.")
+            else -> listOf("1 2 3", "4 5 6", "7 8 9", "10")
+        }
+        val h = prefs.getFloat("hauteur", 1.0f)
+        listOf(Analyse.HOMME, Analyse.FEMME, Analyse.GARCON, Analyse.FILLE).forEachIndexed { i, g ->
+            val cle = if (Analyse.base(g) == Analyse.HOMME) "voix_homme_$l" else "voix_femme_$l"
+            val v = voixToutes.firstOrNull { it.name == prefs.getString(cle, null) }
+            if (v != null) t.voice = v else t.language = locale()
+            t.setPitch(h * Analyse.montee(g))
             val vol = (volEssai ?: Volume(this).also { volEssai = it }).params(prefs.getInt("volume", 100))
             t.speak(phrases[i], if (i == 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD, vol, "t$i")
         }
+    }
+
+    // ---------- Bouton ⋮ ----------
+
+    private fun majBulle() {
+        btBulle.visibility = if (prefs.getBoolean("bulle", true) && !Settings.canDrawOverlays(this)) View.VISIBLE else View.GONE
     }
 
     override fun onResume() {
         super.onResume()
         DoublageService.ecouteur = { rafraichir() }
         rafraichir()
+        majBulle()
     }
 
     override fun onPause() {
@@ -278,7 +382,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun rafraichir() {
-        statut.text = DoublageService.dStatut.ifBlank { "Choisis la langue, puis Démarrer." }
+        statut.text = DoublageService.dStatut.ifBlank { "Choisis les langues, puis Démarrer." }
         original.text = DoublageService.dOriginal
         traduction.text = DoublageService.dTraduction
     }
@@ -286,6 +390,10 @@ class MainActivity : ComponentActivity() {
     private fun demarrer() {
         if (DoublageService.enMarche) {
             statut.text = "Déjà en marche. Arrête d'abord pour changer de langue."
+            return
+        }
+        if (source() == cible()) {
+            statut.text = "Choisis une langue de traduction différente de celle de la vidéo."
             return
         }
         demandePermissions.launch(

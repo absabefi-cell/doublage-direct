@@ -44,22 +44,104 @@ class AnalyseTest {
         assertNull(Analyse.hauteur(b, 4096, taux))
     }
 
+    private fun g(f0: Float, enfants: Int = Analyse.ENFANTS_AUTO, defaut: Int = Analyse.HOMME) =
+        Analyse.genre(f0, 165, 290, enfants, 330, defaut)
+
     @Test fun genres() {
-        assertEquals(Analyse.HOMME, Analyse.genre(110f, 165, 290, true, 0))
-        assertEquals(Analyse.FEMME, Analyse.genre(220f, 165, 290, true, 0))
-        assertEquals(Analyse.ENFANT, Analyse.genre(330f, 165, 290, true, 0))
-        assertEquals(Analyse.FEMME, Analyse.genre(330f, 165, 290, false, 0))
-        assertEquals(Analyse.HOMME, Analyse.genre(0f, 165, 290, true, 0))
-        assertEquals(Analyse.FEMME, Analyse.genre(0f, 165, 290, true, 1))
+        assertEquals(Analyse.HOMME, g(110f))
+        assertEquals(Analyse.FEMME, g(220f))
+        assertEquals(Analyse.GARCON, g(300f))
+        assertEquals(Analyse.FILLE, g(360f))
+        assertEquals(Analyse.GARCON, g(360f, Analyse.ENFANTS_GARCON))
+        assertEquals(Analyse.FILLE, g(300f, Analyse.ENFANTS_FILLE))
+        assertEquals(Analyse.FEMME, g(360f, Analyse.ENFANTS_NON))
+        assertEquals(Analyse.HOMME, g(0f))
+        assertEquals(Analyse.FEMME, g(0f, defaut = Analyse.FEMME))
+    }
+
+    @Test fun voixDeBase() {
+        // Homme -> voix d'homme, femme -> voix de femme, garçon -> voix d'homme montée, fille -> voix de femme montée
+        assertEquals(Analyse.HOMME, Analyse.base(Analyse.HOMME))
+        assertEquals(Analyse.FEMME, Analyse.base(Analyse.FEMME))
+        assertEquals(Analyse.HOMME, Analyse.base(Analyse.GARCON))
+        assertEquals(Analyse.FEMME, Analyse.base(Analyse.FILLE))
+        assertTrue(Analyse.montee(Analyse.GARCON) > 1.2f)
+        assertTrue(Analyse.montee(Analyse.FILLE) > 1.1f)
+        assertEquals(1f, Analyse.montee(Analyse.HOMME))
+        assertEquals(1f, Analyse.montee(Analyse.FEMME))
     }
 
     @Test fun chaineComplete() {
         // Une phrase d'homme puis une de femme : la médiane choisit la bonne voix
         val h = List(10) { Analyse.hauteur(voix(120.0), 4096, taux)!! }
         val f = List(10) { Analyse.hauteur(voix(230.0), 4096, taux)!! }
-        assertEquals(Analyse.HOMME, Analyse.genre(Analyse.mediane(h), 165, 290, true, 0))
-        assertEquals(Analyse.FEMME, Analyse.genre(Analyse.mediane(f), 165, 290, true, 0))
+        assertEquals(Analyse.HOMME, g(Analyse.mediane(h)))
+        assertEquals(Analyse.FEMME, g(Analyse.mediane(f)))
         assertEquals(0f, Analyse.mediane(listOf(100f)))
+    }
+
+    /** Fichier WAV comme celui que la synthèse vocale écrit. */
+    private fun wav(f0: Double, tauxWav: Int = 24000, secondes: Double = 1.0): ByteArray {
+        val n = (tauxWav * secondes).toInt()
+        val data = java.io.ByteArrayOutputStream()
+        for (i in 0 until n) {
+            val t = i.toDouble() / tauxWav
+            val v = 8000 * (sin(2 * PI * f0 * t) + 0.5 * sin(4 * PI * f0 * t)) / 1.5
+            val s = v.toInt()
+            data.write(s and 0xFF); data.write((s shr 8) and 0xFF)
+        }
+        val d = data.toByteArray()
+        val b = java.nio.ByteBuffer.allocate(44 + d.size).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        b.put("RIFF".toByteArray()).putInt(36 + d.size).put("WAVE".toByteArray())
+        b.put("fmt ".toByteArray()).putInt(16).putShort(1).putShort(1).putInt(tauxWav).putInt(tauxWav * 2)
+            .putShort(2).putShort(16)
+        b.put("data".toByteArray()).putInt(d.size).put(d)
+        return b.array()
+    }
+
+    @Test fun triDesVoix() {
+        assertEquals(Analyse.HOMME, Analyse.genreVoix(Analyse.hauteurWav(wav(115.0))))
+        assertEquals(Analyse.FEMME, Analyse.genreVoix(Analyse.hauteurWav(wav(215.0))))
+        assertEquals(Analyse.HOMME, Analyse.genreVoix(Analyse.hauteurWav(wav(130.0, 22050))))
+        assertNull(Analyse.genreVoix(null))
+        assertNull(Analyse.hauteurWav(ByteArray(10)))
+        assertNull(Analyse.genreVoix(Analyse.hauteurWav(wav(200.0, secondes = 0.0))))
+    }
+
+    @Test fun emotions() {
+        // Voix normale : aucun changement
+        val n = Analyse.emotion(200f, 200f, 3000f, 3000f, 2.5f, 2.5f, 1f)
+        n.forEach { assertEquals(1f, it, 0.001f) }
+        // Cri : plus fort, plus aigu, plus rapide
+        val cri = Analyse.emotion(260f, 200f, 12000f, 3000f, 3.5f, 2.5f, 1f)
+        assertTrue(cri[0] > 1.5f); assertTrue(cri[1] > 1.2f); assertTrue(cri[2] > 1.3f)
+        // Tristesse / chuchotement : plus doux, plus lent
+        val triste = Analyse.emotion(190f, 200f, 800f, 3000f, 1.5f, 2.5f, 1f)
+        assertTrue(triste[0] < 0.7f); assertTrue(triste[2] < 0.85f)
+        // Force à 0 : voix neutre
+        Analyse.emotion(260f, 200f, 12000f, 3000f, 3.5f, 2.5f, 0f).forEach { assertEquals(1f, it, 0.001f) }
+        // Voix normale pas encore connue : neutre
+        Analyse.emotion(260f, 0f, 12000f, 0f, 3.5f, 0f, 1f).forEach { assertEquals(1f, it, 0.001f) }
+        // Limites
+        val fort = Analyse.emotion(1000f, 100f, 1e6f, 1f, 50f, 1f, 1f)
+        assertEquals(1.7f, fort[0], 0.001f); assertEquals(1.25f, fort[1], 0.001f); assertEquals(1.35f, fort[2], 0.001f)
+        assertEquals(200f, Analyse.moyenne(0f, 200f)); assertEquals(200f, Analyse.moyenne(200f, 0f))
+        assertEquals(215f, Analyse.moyenne(200f, 300f), 0.01f)
+        assertTrue(Analyse.energie(voix(150.0), 4096) > 3000f)
+        assertEquals(0f, Analyse.energie(ByteArray(4096), 4096))
+    }
+
+    @Test fun langues() {
+        // Toutes les langues dans les deux sens, dont celles demandées
+        listOf("fr", "en", "de", "es", "ko", "ar").forEach { c ->
+            assertTrue("$c manque (vidéo)", Langues.sources.any { it.code == c })
+            assertTrue("$c manque (traduction)", Langues.toutes.any { it.code == c })
+        }
+        assertEquals(Langues.toutes.size, Langues.toutes.map { it.code }.toSet().size)
+        assertTrue(Langues.toutes.size >= 50)
+        assertEquals("zh-CN", Langues.codeVoix("zh"))
+        assertTrue(Langues.parasite("en", "the")); assertTrue(!Langues.parasite("fr", "the bon"))
+        Langues.sources.forEach { assertTrue(it.vosk!!.startsWith("vosk-model")) }
     }
 
     @Test fun volume() {

@@ -5,7 +5,20 @@ object Analyse {
 
     const val HOMME = 0
     const val FEMME = 1
-    const val ENFANT = 2
+    const val GARCON = 2
+    const val FILLE = 3
+
+    /** Réglage des enfants. */
+    const val ENFANTS_NON = 0
+    const val ENFANTS_AUTO = 1
+    const val ENFANTS_GARCON = 2
+    const val ENFANTS_FILLE = 3
+
+    /** Voix de base (homme ou femme) à utiliser pour chaque personnage. */
+    fun base(g: Int): Int = if (g == FEMME || g == FILLE) FEMME else HOMME
+
+    /** Hauteur supplémentaire de la voix : garçon = voix d'homme montée, fille = voix de femme montée. */
+    fun montee(g: Int): Float = when (g) { GARCON -> 1.45f; FILLE -> 1.3f; else -> 1f }
 
     /** Fréquence fondamentale (Hz) d'un bloc PCM 16 bits, par autocorrélation. null si pas de voix nette. */
     fun hauteur(buf: ByteArray, n: Int, taux: Int): Float? {
@@ -44,12 +57,91 @@ object Analyse {
     fun mediane(l: List<Float>): Float =
         if (l.size < 3) 0f else l.sorted()[l.size / 2]
 
-    /** Choix de la voix selon la hauteur f0 (0 = inconnue). */
-    fun genre(f0: Float, seuilFemme: Int, seuilEnfant: Int, enfant: Boolean, defaut: Int): Int = when {
-        f0 <= 0f -> if (defaut == FEMME) FEMME else HOMME
+    /**
+     * Choix de la voix selon la hauteur f0 (0 = inconnue).
+     * Au-dessus de seuilEnfant : enfant. En mode auto, au-dessus de seuilFille : fille, sinon garçon.
+     * (Avant la puberté, garçons et filles ont presque la même hauteur : le mode auto reste une estimation.)
+     */
+    fun genre(f0: Float, seuilFemme: Int, seuilEnfant: Int, enfants: Int, seuilFille: Int, defaut: Int): Int = when {
+        f0 <= 0f -> defaut.coerceIn(HOMME, FILLE)
         f0 < seuilFemme -> HOMME
         f0 < seuilEnfant -> FEMME
-        else -> if (enfant) ENFANT else FEMME
+        enfants == ENFANTS_GARCON -> GARCON
+        enfants == ENFANTS_FILLE -> FILLE
+        enfants == ENFANTS_AUTO -> if (f0 >= seuilFille) FILLE else GARCON
+        else -> FEMME
+    }
+
+    /** Classement d'une voix de synthèse d'après sa hauteur moyenne. null = pas mesurée. */
+    fun genreVoix(f0: Float?): Int? = when {
+        f0 == null || f0 <= 0f -> null
+        f0 < 170f -> HOMME
+        else -> FEMME
+    }
+
+    /** Hauteur médiane d'un fichier WAV PCM 16 bits mono (sortie de la synthèse vocale). */
+    fun hauteurWav(w: ByteArray): Float? {
+        if (w.size < 44 || String(w, 0, 4) != "RIFF") return null
+        fun int(o: Int) = (w[o].toInt() and 0xFF) or ((w[o + 1].toInt() and 0xFF) shl 8) or
+            ((w[o + 2].toInt() and 0xFF) shl 16) or ((w[o + 3].toInt() and 0xFF) shl 24)
+        var o = 12
+        var taux = 0; var canaux = 1; var bits = 16
+        while (o + 8 <= w.size) {
+            val id = String(w, o, 4); val t = int(o + 4)
+            if (id == "fmt ") {
+                canaux = (w[o + 10].toInt() and 0xFF); taux = int(o + 12); bits = (w[o + 22].toInt() and 0xFF)
+            }
+            if (id == "data") { o += 8; break }
+            o += 8 + t + (t and 1)
+        }
+        if (taux <= 0 || bits != 16 || canaux != 1 || o >= w.size) return null
+        val l = ArrayList<Float>()
+        val bloc = 2048
+        var i = o
+        while (i + bloc <= w.size) {
+            hauteur(w.copyOfRange(i, i + bloc), bloc, taux)?.let { l.add(it) }
+            i += bloc
+        }
+        val m = mediane(l)
+        return if (m > 0f) m else null
+    }
+
+    /** Énergie (RMS) d'un bloc PCM 16 bits. */
+    fun energie(buf: ByteArray, n: Int): Float {
+        var e = 0.0; var c = 0
+        var i = 0
+        while (i + 1 < n) {
+            val v = ((buf[i].toInt() and 0xFF) or (buf[i + 1].toInt() shl 8)).toShort().toDouble()
+            e += v * v; c++; i += 2
+        }
+        return if (c == 0) 0f else Math.sqrt(e / c).toFloat()
+    }
+
+    /** Moyenne glissante de la voix normale d'un personnage (0 = pas encore connue). */
+    fun moyenne(ancienne: Float, nouvelle: Float): Float = when {
+        nouvelle <= 0f -> ancienne
+        ancienne <= 0f -> nouvelle
+        else -> 0.85f * ancienne + 0.15f * nouvelle
+    }
+
+    /**
+     * Émotion : on compare la phrase à la voix normale du personnage.
+     * Renvoie les facteurs (volume, hauteur, vitesse), adoucis par force (0..1).
+     */
+    fun emotion(f0: Float, f0Base: Float, energie: Float, energieBase: Float,
+                debit: Float, debitBase: Float, force: Float): FloatArray {
+        fun r(x: Float, b: Float, lo: Float, hi: Float, racine: Boolean = false): Float {
+            if (x <= 0f || b <= 0f) return 1f
+            val q = if (racine) Math.sqrt((x / b).toDouble()).toFloat() else x / b
+            return q.coerceIn(lo, hi)
+        }
+        val f = force.coerceIn(0f, 1f)
+        fun doux(v: Float) = 1f + f * (v - 1f)
+        return floatArrayOf(
+            doux(r(energie, energieBase, 0.6f, 1.7f, racine = true)),
+            doux(r(f0, f0Base, 0.85f, 1.25f)),
+            doux(r(debit, debitBase, 0.8f, 1.35f))
+        )
     }
 
     /** Volume de la synthèse (0..1) : la partie sous 100 %. */

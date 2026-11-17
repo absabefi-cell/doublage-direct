@@ -60,7 +60,13 @@ class DoublageService : Service() {
     private val prefs by lazy { getSharedPreferences(PREFS, MODE_PRIVATE) }
     private lateinit var audio: AudioManager
     private var baisser = true
-    private var langue = "fr"
+    private var source = "en"
+    private var cible = "fr"
+    private var bulle: Bulle? = null
+    // Voix normale de chaque personnage (homme, femme, garçon, fille) : pour mesurer les émotions
+    private val f0Base = FloatArray(4)
+    private val energieBase = FloatArray(4)
+    private val debitBase = FloatArray(4)
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -80,7 +86,8 @@ class DoublageService : Service() {
             intent.getParcelableExtra("data", Intent::class.java)
         else
             @Suppress("DEPRECATION") intent.getParcelableExtra("data")
-        langue = intent.getStringExtra("langue") ?: "fr"
+        source = intent.getStringExtra("source") ?: "en"
+        cible = intent.getStringExtra("cible") ?: "fr"
         baisser = intent.getBooleanExtra("baisser", true)
 
         if (data == null) { stopSelf(); return START_NOT_STICKY }
@@ -105,10 +112,9 @@ class DoublageService : Service() {
                 statut("Synthèse vocale indisponible sur ce téléphone.")
                 return@TextToSpeech
             }
-            val loc = if (langue == "ar") Locale("ar") else Locale.FRENCH
-            val r = tts?.setLanguage(loc)
+            val r = tts?.setLanguage(locale())
             if (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED) {
-                statut("Voix ${if (langue == "ar") "arabe" else "française"} absente : installe-la dans Paramètres > Synthèse vocale (Google).")
+                statut("Voix ${Langues.trouver(cible).nom} absente : installe-la dans Paramètres > Synthèse vocale (Google).")
             }
             tts?.setAudioAttributes(attributsParole())
             tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
@@ -120,10 +126,16 @@ class DoublageService : Service() {
             })
         }
 
-        statut("Téléchargement du traducteur (première fois seulement, il faut Internet)...")
+        val de = TranslateLanguage.fromLanguageTag(source)
+        val vers = TranslateLanguage.fromLanguageTag(cible)
+        if (de == null || vers == null || de == vers) {
+            statut(if (de != null && de == vers) "La langue de la vidéo et celle de la traduction sont pareilles." else "Langue non prise en charge.")
+            return
+        }
+        statut("Téléchargement du traducteur ${Langues.trouver(source).nom} → ${Langues.trouver(cible).nom} (première fois seulement, il faut Internet)...")
         val opts = TranslatorOptions.Builder()
-            .setSourceLanguage(TranslateLanguage.ENGLISH)
-            .setTargetLanguage(if (langue == "ar") TranslateLanguage.ARABIC else TranslateLanguage.FRENCH)
+            .setSourceLanguage(de)
+            .setTargetLanguage(vers)
             .build()
         traducteur = Translation.getClient(opts).also { t ->
             t.downloadModelIfNeeded(DownloadConditions.Builder().build())
@@ -132,11 +144,30 @@ class DoublageService : Service() {
         }
     }
 
+    private fun locale(): Locale = Locale.forLanguageTag(Langues.codeVoix(cible))
+
     private fun chargerVosk() {
         statut("Chargement de la reconnaissance vocale...")
-        StorageService.unpack(this, "model-en-us", "model",
-            { m -> model = m; demarrerCapture() },
-            { e -> statut("Erreur modèle vocal : ${e.message}") })
+        if (source == Langues.VOSK_INCLUS) {
+            StorageService.unpack(this, "model-en-us", "model",
+                { m -> model = m; demarrerCapture() },
+                { e -> statut("Erreur modèle vocal : ${e.message}") })
+            return
+        }
+        val l = Langues.trouver(source)
+        Thread {
+            try {
+                val dossier = Modeles.telecharger(this, l) { p ->
+                    statut("Téléchargement de l'écoute ${l.nom} : $p % (une seule fois, garde Internet)")
+                }
+                if (!enMarche) return@Thread
+                statut("Chargement de la reconnaissance vocale ${l.nom}...")
+                val m = Model(dossier.absolutePath)
+                principal.post { if (enMarche) { model = m; demarrerCapture() } else m.close() }
+            } catch (e: Exception) {
+                statut("Erreur modèle ${l.nom} : ${e.message}. Vérifie Internet et réessaie.")
+            }
+        }.start()
     }
 
     // ---------- Capture du son de YouTube ----------
@@ -169,6 +200,9 @@ class DoublageService : Service() {
         rec.startRecording()
         actif = true
         statut("J'écoute. Lance ta vidéo YouTube.")
+        if (prefs.getBoolean("bulle", true)) {
+            bulle = Bulle(this, prefs) { stopSelf() }.also { it.montrer() }
+        }
 
         val m = model ?: return
         fil = Thread {
@@ -178,6 +212,13 @@ class DoublageService : Service() {
             var averti = false
             var debutPhrase = 0L
             val hauteurs = ArrayList<Float>()
+            val energies = ArrayList<Float>()
+            var debutVoix = 0L
+            fun fin(t: String) {
+                val duree = if (debutVoix > 0) System.currentTimeMillis() - debutVoix else 0L
+                traiter(t, Analyse.mediane(hauteurs), Analyse.mediane(energies), duree)
+                hauteurs.clear(); energies.clear(); debutPhrase = 0L; debutVoix = 0L
+            }
             while (actif) {
                 val n = rec.read(buf, 0, buf.size)
                 if (n <= 0) continue
@@ -192,11 +233,13 @@ class DoublageService : Service() {
                 }
 
                 // Hauteur de la voix (pour choisir voix homme / femme / enfant)
-                Analyse.hauteur(buf, n, TAUX)?.let { if (hauteurs.size < 400) hauteurs.add(it) }
+                Analyse.hauteur(buf, n, TAUX)?.let {
+                    if (hauteurs.size < 400) { hauteurs.add(it); energies.add(Analyse.energie(buf, n)) }
+                    if (debutVoix == 0L) debutVoix = System.currentTimeMillis()
+                }
 
                 if (reco.acceptWaveForm(buf, n)) {
-                    traiter(texte(reco.result, "text"), Analyse.mediane(hauteurs))
-                    hauteurs.clear(); debutPhrase = 0L
+                    fin(texte(reco.result, "text"))
                 } else {
                     // On coupe vite pour coller à la vidéo : trop de mots ou trop longtemps
                     val partiel = texte(reco.partialResult, "partial")
@@ -206,9 +249,8 @@ class DoublageService : Service() {
                     val mots = partiel.split(" ").size
                     val maxMots = prefs.getInt("mots_max", 8)
                     if (Analyse.couper(mots, maintenant - debutPhrase, maxMots)) {
-                        traiter(texte(reco.finalResult, "text"), Analyse.mediane(hauteurs))
+                        fin(texte(reco.finalResult, "text"))
                         reco.reset()
-                        hauteurs.clear(); debutPhrase = 0L
                     }
                 }
             }
@@ -231,46 +273,57 @@ class DoublageService : Service() {
 
     // ---------- Traduction et parole ----------
 
-    private fun traiter(t: String, f0: Float) {
-        if (t.length < 3 || t == "the" || t == "huh") return
+    private fun traiter(t: String, f0: Float, energie: Float, dureeMs: Long) {
+        if (Langues.parasite(source, t)) return
         dOriginal = t
         signaler()
+        val mots = t.split(" ").count { it.isNotBlank() }
+        val debit = if (dureeMs > 300) mots * 1000f / dureeMs else 0f
         principal.post {
             traducteur?.translate(t)?.addOnSuccessListener { tr ->
                 dTraduction = tr
                 notifier(tr)
                 signaler()
-                parler(tr, f0)
+                parler(tr, f0, energie, debit)
             }
         }
     }
 
     private fun genre(f0: Float): Int = Analyse.genre(
         f0, prefs.getInt("seuil_femme", 165), prefs.getInt("seuil_enfant", 290),
-        prefs.getBoolean("enfant", true), prefs.getInt("defaut", 0)
+        prefs.getInt("enfants", Analyse.ENFANTS_AUTO), prefs.getInt("seuil_fille", 330),
+        prefs.getInt("defaut", Analyse.HOMME)
     )
 
-    private fun parler(t: String, f0: Float) {
+    private fun parler(t: String, f0: Float, energie: Float, debit: Float) {
         val tt = tts ?: return
         // Retard : s'il reste déjà 2 phrases à dire, on les saute pour rattraper la vidéo
         val enRetard = enCours.size >= 2
         if (enRetard) enCours.clear()
 
-        val g = if (prefs.getBoolean("auto", true)) genre(f0) else prefs.getInt("defaut", 0)
-        val nomVoix = prefs.getString(if (g == 0) "voix_homme_$langue" else "voix_femme_$langue", null)
+        val g = if (prefs.getBoolean("auto", true)) genre(f0) else prefs.getInt("defaut", Analyse.HOMME)
+        val nomVoix = prefs.getString(if (Analyse.base(g) == Analyse.HOMME) "voix_homme_$cible" else "voix_femme_$cible", null)
         val v = tt.voices?.firstOrNull { it.name == nomVoix }
-        if (v != null) tt.voice = v else tt.language = if (langue == "ar") Locale("ar") else Locale.FRENCH
+        if (v != null) tt.voice = v else tt.language = locale()
 
-        // Vitesse : réglage de base + accélération si on prend du retard
+        // Émotions : on compare la phrase à la voix normale de ce personnage
+        val e = Analyse.emotion(f0, f0Base[g], energie, energieBase[g], debit, debitBase[g],
+            prefs.getInt("emotions", 60) / 100f)
+        f0Base[g] = Analyse.moyenne(f0Base[g], f0)
+        energieBase[g] = Analyse.moyenne(energieBase[g], energie)
+        debitBase[g] = Analyse.moyenne(debitBase[g], debit)
+
+        // Vitesse : réglage de base x émotion + accélération si on prend du retard
         val base = prefs.getFloat("vitesse", 1.2f)
-        tt.setSpeechRate(minOf(base * (1f + 0.25f * enCours.size), 2.5f))
+        tt.setSpeechRate(minOf(base * e[2] * (1f + 0.25f * enCours.size), 2.5f))
         val h = prefs.getFloat("hauteur", 1.0f)
-        tt.setPitch(if (g == 2) h * 1.4f else h)
+        tt.setPitch(h * Analyse.montee(g) * e[1])
 
         val id = "u" + System.nanoTime()
         enCours.add(id)
         if (baisser) prendreFocus()
-        val vol = (volume ?: Volume(this).also { volume = it }).params(prefs.getInt("volume", 100), compensationMb)
+        val pct = (prefs.getInt("volume", 100) * e[0]).toInt().coerceIn(10, 300)
+        val vol = (volume ?: Volume(this).also { volume = it }).params(pct, compensationMb)
         tt.speak(t, if (enRetard) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD, vol, id)
     }
 
@@ -376,6 +429,8 @@ class DoublageService : Service() {
     override fun onDestroy() {
         actif = false
         enMarche = false
+        bulle?.cacher()
+        bulle = null
         try { record?.stop() } catch (_: Exception) {}
         try { fil?.join(800) } catch (_: Exception) {}
         record?.release()
