@@ -59,6 +59,32 @@ object Analyse {
     fun gainMb(pourcent: Int): Int =
         if (pourcent <= 100) 0 else (2000 * Math.log10(pourcent.coerceAtMost(300) / 100.0)).toInt()
 
+    /** Niveau approximatif (dB) d'un cran de volume si le téléphone ne le donne pas. */
+    fun dbApprox(i: Int, max: Int): Float =
+        if (i <= 0) -96f else (50.0 * (i - max) / max.coerceAtLeast(1)).toFloat()
+
+    /**
+     * Cran de volume média qui donne environ `pourcent` du volume actuel (dbs.last()).
+     * Jamais 0 (sinon la traduction serait coupée aussi), baisse limitée à 18 dB.
+     */
+    fun indexCible(dbs: List<Float>, pourcent: Int): Int {
+        val base = dbs.size - 1
+        if (base <= 1 || pourcent >= 100) return base
+        val baisse = maxOf(20 * Math.log10(pourcent.coerceAtLeast(1) / 100.0), -18.0)
+        val vise = dbs[base] + baisse
+        var meilleur = base
+        for (i in 1..base) {
+            val d = dbs[i]
+            if (d.isInfinite() || d.isNaN()) continue
+            if (d >= vise - 1.5 && Math.abs(d - vise) < Math.abs(dbs[meilleur] - vise)) meilleur = i
+        }
+        return meilleur
+    }
+
+    /** Amplification de la traduction pour compenser la baisse du volume média (max 18 dB). */
+    fun compensationMb(dbAvant: Float, dbApres: Float): Int =
+        (((dbAvant - dbApres).coerceIn(0f, 18f)) * 100).toInt()
+
     /** Faut-il traduire tout de suite la phrase en cours ? */
     fun couper(mots: Int, dureeMs: Long, maxMots: Int): Boolean =
         mots >= maxMots || (mots >= 3 && dureeMs > 3500)

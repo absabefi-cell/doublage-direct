@@ -14,8 +14,8 @@ class Volume(context: Context) {
     } catch (e: Exception) { null }
 
     /** Paramètres à passer à tts.speak() pour un volume en pourcentage. */
-    fun params(pourcent: Int): Bundle {
-        try { ampli?.setTargetGain(Analyse.gainMb(pourcent)) } catch (_: Exception) {}
+    fun params(pourcent: Int, compensationMb: Int = 0): Bundle {
+        try { ampli?.setTargetGain(Analyse.gainMb(pourcent) + compensationMb) } catch (_: Exception) {}
         return Bundle().apply {
             putInt(TextToSpeech.Engine.KEY_PARAM_SESSION_ID, session)
             putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, Analyse.volumeTts(pourcent))

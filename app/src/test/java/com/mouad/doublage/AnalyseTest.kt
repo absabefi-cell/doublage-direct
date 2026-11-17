@@ -72,6 +72,22 @@ class AnalyseTest {
         assertEquals(954, Analyse.gainMb(500))
     }
 
+    @Test fun volumeOriginal() {
+        // 15 crans, environ 3 dB par cran
+        val dbs = (0..15).map { if (it == 0) -96f else -3f * (15 - it) }
+        assertEquals(15, Analyse.indexCible(dbs, 100))
+        val i50 = Analyse.indexCible(dbs, 50)       // -6 dB
+        assertEquals(13, i50)
+        val i25 = Analyse.indexCible(dbs, 25)       // -12 dB
+        assertEquals(11, i25)
+        assertTrue(Analyse.indexCible(dbs, 1) >= 9) // baisse limitée à 18 dB, jamais 0
+        assertEquals(600, Analyse.compensationMb(dbs[15], dbs[i50]))
+        assertEquals(1800, Analyse.compensationMb(0f, -40f))
+        assertEquals(1, Analyse.indexCible(listOf(-96f, -20f), 10)) // volume déjà au minimum : on ne touche pas
+        assertEquals(-96f, Analyse.dbApprox(0, 15))
+        assertEquals(0f, Analyse.dbApprox(15, 15))
+    }
+
     @Test fun coupure() {
         assertTrue(Analyse.couper(8, 500, 8))
         assertTrue(!Analyse.couper(5, 1000, 8))

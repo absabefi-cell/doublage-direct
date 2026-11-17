@@ -10,7 +10,6 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.drawable.Icon
 import android.media.AudioAttributes
-import android.media.AudioFocusRequest
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioPlaybackCaptureConfiguration
@@ -60,7 +59,6 @@ class DoublageService : Service() {
     private val enCours = ConcurrentHashMap.newKeySet<String>()
     private val prefs by lazy { getSharedPreferences(PREFS, MODE_PRIVATE) }
     private lateinit var audio: AudioManager
-    private var focus: AudioFocusRequest? = null
     private var baisser = true
     private var langue = "fr"
 
@@ -272,7 +270,7 @@ class DoublageService : Service() {
         val id = "u" + System.nanoTime()
         enCours.add(id)
         if (baisser) prendreFocus()
-        val vol = (volume ?: Volume(this).also { volume = it }).params(prefs.getInt("volume", 100))
+        val vol = (volume ?: Volume(this).also { volume = it }).params(prefs.getInt("volume", 100), compensationMb)
         tt.speak(t, if (enRetard) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD, vol, id)
     }
 
@@ -286,17 +284,45 @@ class DoublageService : Service() {
         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
         .build()
 
+    // ---------- Volume de YouTube pendant la traduction ----------
+    // On baisse le volume média du téléphone (YouTube) et on amplifie la traduction d'autant,
+    // pour que seule la vidéo baisse. Volume remis comme avant quand la traduction se tait.
+    private var indexAvant = -1
+    private var compensationMb = 0
+
     private fun prendreFocus() {
-        if (focus != null) return
-        focus = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
-            .setAudioAttributes(attributsParole())
-            .build()
-        audio.requestAudioFocus(focus!!)
+        if (indexAvant >= 0) return
+        val pct = prefs.getInt("volume_original", 40)
+        if (pct >= 100) return
+        val m = AudioManager.STREAM_MUSIC
+        val base = audio.getStreamVolume(m)
+        if (base <= 0) return
+        val dbs = (0..base).map { i -> niveauDb(i, audio.getStreamMaxVolume(m)) }
+        val cible = Analyse.indexCible(dbs, pct)
+        if (cible >= base) return
+        compensationMb = Analyse.compensationMb(dbs[base], dbs[cible])
+        indexAvant = base
+        try { audio.setStreamVolume(m, cible, 0) } catch (_: Exception) { indexAvant = -1; compensationMb = 0 }
+    }
+
+    private fun niveauDb(i: Int, max: Int): Float {
+        val sortie = audio.getDevices(AudioManager.GET_DEVICES_OUTPUTS).map { it.type }
+        val type = listOf(
+            android.media.AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
+            android.media.AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+            android.media.AudioDeviceInfo.TYPE_WIRED_HEADSET,
+            android.media.AudioDeviceInfo.TYPE_USB_HEADSET
+        ).firstOrNull { it in sortie } ?: android.media.AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+        val db = try { audio.getStreamVolumeDb(AudioManager.STREAM_MUSIC, i, type) } catch (_: Exception) { Float.NaN }
+        return if (db.isNaN()) Analyse.dbApprox(i, max) else db
     }
 
     private fun rendreFocus() {
-        focus?.let { audio.abandonAudioFocusRequest(it) }
-        focus = null
+        if (indexAvant >= 0) {
+            try { audio.setStreamVolume(AudioManager.STREAM_MUSIC, indexAvant, 0) } catch (_: Exception) {}
+        }
+        indexAvant = -1
+        compensationMb = 0
     }
 
     // ---------- Notification et état ----------

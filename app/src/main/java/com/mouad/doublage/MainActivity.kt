@@ -155,9 +155,13 @@ class MainActivity : ComponentActivity() {
             prefs.edit().putInt("volume", it).apply()
         }
         col.addView(TextView(this).apply {
-            text = "Le son de YouTube se règle avec les boutons de volume du téléphone. La traduction suit ce volume, plus ce curseur."
+            text = "Les boutons de volume du téléphone règlent tout. Ces deux curseurs règlent l'équilibre entre la vidéo et la traduction."
             textSize = 12f
         })
+        curseur("Volume de YouTube pendant la traduction", "volume_original", 10, 100, 40,
+            { "$it %" + if (it >= 100) " (pas baissé)" else "" }) {
+            prefs.edit().putInt("volume_original", it).apply()
+        }
         curseur("Réactivité (mots max avant de traduire)", "mots_max", 4, 16, 8,
             { "$it mots" + if (it <= 6) " (très rapide)" else if (it >= 12) " (phrases plus complètes)" else "" }) {
             prefs.edit().putInt("mots_max", it).apply()
