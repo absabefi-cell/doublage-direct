@@ -12,7 +12,8 @@ import android.widget.TextView
  */
 object Reglages {
 
-    fun ajouter(ctx: Context, col: LinearLayout, prefs: SharedPreferences, complet: Boolean, couleurTexte: Int? = null) {
+    fun ajouter(ctx: Context, col: LinearLayout, prefs: SharedPreferences, complet: Boolean, couleurTexte: Int? = null,
+                essai: Boolean = false) {
         val d = ctx.resources.displayMetrics.density
         fun dp(v: Int) = (v * d).toInt()
 
@@ -35,7 +36,10 @@ object Reglages {
                     else prefs.edit().putInt(cle, v).apply()
                 }
                 override fun onStartTrackingTouch(s: SeekBar?) {}
-                override fun onStopTrackingTouch(s: SeekBar?) {}
+                override fun onStopTrackingTouch(s: SeekBar?) {
+                    // Pendant le doublage : on redit la dernière phrase pour entendre le changement tout de suite
+                    if (essai && cle != "mots_max" && cle != "filtre") prefs.edit().putLong("essai", System.currentTimeMillis()).apply()
+                }
             })
             col.addView(sb)
         }
@@ -52,8 +56,11 @@ object Reglages {
             "$it %" + if (it == 0) " (voix neutre)" else ""
         }
         if (complet) {
-            curseur("Réactivité (mots max avant de traduire)", "mots_max", 4, 16, 8, false) {
-                "$it mots" + if (it <= 6) " (très rapide)" else if (it >= 12) " (phrases plus complètes)" else ""
+            curseur("Réactivité (mots max avant de traduire)", "mots_max", 4, 16, 10, false) {
+                "$it mots" + if (it <= 6) " (très rapide, moins de sens)" else if (it >= 12) " (phrases plus complètes)" else ""
+            }
+            curseur("Filtre des phrases mal entendues", "filtre", 0, 90, 45, false) {
+                if (it == 0) "0 % (tout traduire)" else "$it %" + if (it >= 65) " (strict)" else ""
             }
         }
     }

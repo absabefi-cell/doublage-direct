@@ -31,8 +31,10 @@ import org.json.JSONObject
 import org.vosk.Model
 import org.vosk.Recognizer
 import org.vosk.android.StorageService
+import android.content.SharedPreferences
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 
 class DoublageService : Service() {
 
@@ -50,23 +52,50 @@ class DoublageService : Service() {
     private val principal = Handler(Looper.getMainLooper())
     private var projection: MediaProjection? = null
     private var record: AudioRecord? = null
-    private var model: Model? = null
-    private var traducteur: Translator? = null
     private var tts: TextToSpeech? = null
     private var volume: Volume? = null
     private var fil: Thread? = null
     @Volatile private var actif = false
-    private val enCours = ConcurrentHashMap.newKeySet<String>()
     private val prefs by lazy { getSharedPreferences(PREFS, MODE_PRIVATE) }
     private lateinit var audio: AudioManager
     private var baisser = true
-    private var source = "en"
+    private var choixSource = "en"          // ce que l'utilisateur a choisi (peut être « auto »)
+    @Volatile private var source = "en"     // langue réellement écoutée
     private var cible = "fr"
     private var bulle: Bulle? = null
+
+    // Modèles d'écoute chargés (un seul, ou plusieurs en détection automatique)
+    private val modeles = ConcurrentHashMap<String, Model>()
+    // Traducteurs prêts, par langue de départ
+    private val traducteurs = ConcurrentHashMap<String, Translator>()
+    @Volatile private var traducteur: Translator? = null
+
+    // Chaque nouvelle vidéo (ou « Recommencer ») change de génération : les vieilles phrases sont jetées
+    private val generation = AtomicInteger(0)
+    @Volatile private var aRemettre = false
+    @Volatile private var aDetecter = false
+
+    // File des phrases à dire, gérée par nous (et non par la synthèse) :
+    // les réglages sont appliqués au moment de parler, et les phrases trop vieilles sont sautées.
+    private class Phrase(val texte: String, val f0: Float, val energie: Float, val debit: Float,
+                         val t0: Long, val gen: Int)
+    private val file = ArrayDeque<Phrase>()
+    private var parle = false
+    private var idEnCours: String? = null
+
     // Voix normale de chaque personnage (homme, femme, garçon, fille) : pour mesurer les émotions
     private val f0Base = FloatArray(4)
     private val energieBase = FloatArray(4)
     private val debitBase = FloatArray(4)
+
+    private val changementReglage = SharedPreferences.OnSharedPreferenceChangeListener { _, cle ->
+        when (cle) {
+            "volume" -> volume?.params(prefs.getInt("volume", 100), compensationMb)
+            "volume_original" -> if (indexAvant >= 0) { rendreFocus(); if (parle) prendreFocus() }
+            "essai" -> essaiReglage()
+            "recommencer" -> recommencer(redetecter = true)
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -86,7 +115,8 @@ class DoublageService : Service() {
             intent.getParcelableExtra("data", Intent::class.java)
         else
             @Suppress("DEPRECATION") intent.getParcelableExtra("data")
-        source = intent.getStringExtra("source") ?: "en"
+        choixSource = intent.getStringExtra("source") ?: "en"
+        source = if (choixSource == Langues.AUTO) "" else choixSource
         cible = intent.getStringExtra("cible") ?: "fr"
         baisser = intent.getBooleanExtra("baisser", true)
 
@@ -100,6 +130,7 @@ class DoublageService : Service() {
         enMarche = true
         dOriginal = ""
         dTraduction = ""
+        prefs.registerOnSharedPreferenceChangeListener(changementReglage)
         preparer()
         return START_NOT_STICKY
     }
@@ -126,47 +157,60 @@ class DoublageService : Service() {
             })
         }
 
-        val de = TranslateLanguage.fromLanguageTag(source)
-        val vers = TranslateLanguage.fromLanguageTag(cible)
-        if (de == null || vers == null || de == vers) {
-            statut(if (de != null && de == vers) "La langue de la vidéo et celle de la traduction sont pareilles." else "Langue non prise en charge.")
-            return
-        }
-        statut("Téléchargement du traducteur ${Langues.trouver(source).nom} → ${Langues.trouver(cible).nom} (première fois seulement, il faut Internet)...")
-        val opts = TranslatorOptions.Builder()
-            .setSourceLanguage(de)
-            .setTargetLanguage(vers)
-            .build()
-        traducteur = Translation.getClient(opts).also { t ->
-            t.downloadModelIfNeeded(DownloadConditions.Builder().build())
-                .addOnSuccessListener { chargerVosk() }
-                .addOnFailureListener { statut("Erreur traducteur : ${it.message}. Vérifie Internet et réessaie.") }
+        if (choixSource == Langues.AUTO) {
+            chargerModeles(Langues.choixAuto(prefs.getStringSet("auto_langues", null)))
+        } else {
+            preparerTraducteur(source) { chargerModeles(listOf(Langues.trouver(source))) }
         }
     }
 
     private fun locale(): Locale = Locale.forLanguageTag(Langues.codeVoix(cible))
 
-    private fun chargerVosk() {
-        statut("Chargement de la reconnaissance vocale...")
-        if (source == Langues.VOSK_INCLUS) {
-            StorageService.unpack(this, "model-en-us", "model",
-                { m -> model = m; demarrerCapture() },
-                { e -> statut("Erreur modèle vocal : ${e.message}") })
-            return
-        }
-        val l = Langues.trouver(source)
+    /** Traducteur source → cible (téléchargé la première fois). ok() appelé quand il est prêt. */
+    private fun preparerTraducteur(de: String, ok: () -> Unit) {
+        if (de == cible) { traducteur = null; ok(); return }
+        traducteurs[de]?.let { traducteur = it; ok(); return }
+        val a = TranslateLanguage.fromLanguageTag(de)
+        val b = TranslateLanguage.fromLanguageTag(cible)
+        if (a == null || b == null) { statut("Traduction ${Langues.trouver(de).nom} → ${Langues.trouver(cible).nom} non prise en charge."); return }
+        statut("Préparation du traducteur ${Langues.trouver(de).nom} → ${Langues.trouver(cible).nom} (la première fois, il faut Internet)...")
+        val t = Translation.getClient(TranslatorOptions.Builder().setSourceLanguage(a).setTargetLanguage(b).build())
+        t.downloadModelIfNeeded(DownloadConditions.Builder().build())
+            .addOnSuccessListener { traducteurs[de] = t; traducteur = t; ok() }
+            .addOnFailureListener { statut("Erreur traducteur : ${it.message}. Vérifie Internet et réessaie.") }
+    }
+
+    /** Charge (et télécharge au besoin) les modèles d'écoute, puis démarre la capture. */
+    private fun chargerModeles(langues: List<Langue>) {
         Thread {
-            try {
-                val dossier = Modeles.telecharger(this, l) { p ->
-                    statut("Téléchargement de l'écoute ${l.nom} : $p % (une seule fois, garde Internet)")
-                }
+            for (l in langues) {
                 if (!enMarche) return@Thread
-                statut("Chargement de la reconnaissance vocale ${l.nom}...")
-                val m = Model(dossier.absolutePath)
-                principal.post { if (enMarche) { model = m; demarrerCapture() } else m.close() }
-            } catch (e: Exception) {
-                statut("Erreur modèle ${l.nom} : ${e.message}. Vérifie Internet et réessaie.")
+                if (modeles.containsKey(l.code)) continue
+                try {
+                    val dossier = if (l.code == Langues.VOSK_INCLUS) {
+                        statut("Chargement de l'écoute ${l.nom}...")
+                        java.io.File(StorageService.sync(this, "model-en-us", "model"))
+                    } else {
+                        Modeles.telecharger(this, l) { p ->
+                            statut("Téléchargement de l'écoute ${l.nom} : $p % (une seule fois, garde Internet)")
+                        }
+                    }
+                    statut("Chargement de l'écoute ${l.nom}...")
+                    modeles[l.code] = Model(dossier.absolutePath)
+                } catch (e: Exception) {
+                    statut("Erreur modèle ${l.nom} : ${e.message}. Vérifie Internet et réessaie.")
+                }
             }
+            if (modeles.isEmpty()) return@Thread
+            if (choixSource == Langues.AUTO) {
+                if (modeles.size == 1) {
+                    val seule = modeles.keys.first()
+                    principal.post { preparerTraducteur(seule) { source = seule; principal.post { demarrerCapture() } } }
+                    return@Thread
+                }
+                aDetecter = true
+            }
+            principal.post { if (enMarche) demarrerCapture() }
         }.start()
     }
 
@@ -174,6 +218,7 @@ class DoublageService : Service() {
 
     @SuppressLint("MissingPermission")
     private fun demarrerCapture() {
+        if (record != null) return
         val p = projection ?: return
         val config = AudioPlaybackCaptureConfiguration.Builder(p)
             .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
@@ -199,64 +244,133 @@ class DoublageService : Service() {
         record = rec
         rec.startRecording()
         actif = true
-        statut("J'écoute. Lance ta vidéo YouTube.")
+        statut(if (aDetecter) "J'écoute pour trouver la langue de la vidéo (${modeles.keys.joinToString { Langues.trouver(it).nom }})..."
+               else "J'écoute (${Langues.trouver(source).nom}). Lance ta vidéo YouTube.")
         if (prefs.getBoolean("bulle", true)) {
             bulle = Bulle(this, prefs) { stopSelf() }.also { it.montrer() }
         }
-
-        val m = model ?: return
-        fil = Thread {
-            val reco = Recognizer(m, TAUX.toFloat())
-            val buf = ByteArray(4096)
-            var dernierSon = System.currentTimeMillis()
-            var averti = false
-            var debutPhrase = 0L
-            val hauteurs = ArrayList<Float>()
-            val energies = ArrayList<Float>()
-            var debutVoix = 0L
-            fun fin(t: String) {
-                val duree = if (debutVoix > 0) System.currentTimeMillis() - debutVoix else 0L
-                traiter(t, Analyse.mediane(hauteurs), Analyse.mediane(energies), duree)
-                hauteurs.clear(); energies.clear(); debutPhrase = 0L; debutVoix = 0L
-            }
-            while (actif) {
-                val n = rec.read(buf, 0, buf.size)
-                if (n <= 0) continue
-
-                // Détection du silence total (app qui bloque la capture)
-                if (aDuSon(buf, n)) {
-                    dernierSon = System.currentTimeMillis()
-                    if (averti) { averti = false; statut("J'écoute.") }
-                } else if (!averti && System.currentTimeMillis() - dernierSon > 20000) {
-                    averti = true
-                    statut("Aucun son capté depuis 20 s. Vidéo en pause, ou l'app bloque la capture.")
-                }
-
-                // Hauteur de la voix (pour choisir voix homme / femme / enfant)
-                Analyse.hauteur(buf, n, TAUX)?.let {
-                    if (hauteurs.size < 400) { hauteurs.add(it); energies.add(Analyse.energie(buf, n)) }
-                    if (debutVoix == 0L) debutVoix = System.currentTimeMillis()
-                }
-
-                if (reco.acceptWaveForm(buf, n)) {
-                    fin(texte(reco.result, "text"))
-                } else {
-                    // On coupe vite pour coller à la vidéo : trop de mots ou trop longtemps
-                    val partiel = texte(reco.partialResult, "partial")
-                    if (partiel.isEmpty()) continue
-                    val maintenant = System.currentTimeMillis()
-                    if (debutPhrase == 0L) debutPhrase = maintenant
-                    val mots = partiel.split(" ").size
-                    val maxMots = prefs.getInt("mots_max", 8)
-                    if (Analyse.couper(mots, maintenant - debutPhrase, maxMots)) {
-                        fin(texte(reco.finalResult, "text"))
-                        reco.reset()
-                    }
-                }
-            }
-            reco.close()
-        }.apply { start() }
+        fil = Thread { boucle(rec) }.apply { start() }
     }
+
+    private fun nouveauReco(m: Model) = Recognizer(m, TAUX.toFloat()).apply { setWords(true) }
+
+    /** Boucle d'écoute (fil séparé). */
+    private fun boucle(rec: AudioRecord) {
+        val buf = ByteArray(4096)
+        var reco: Recognizer? = if (!aDetecter) modeles[source]?.let { nouveauReco(it) } else null
+        val detection = HashMap<String, Recognizer>()
+        val scores = HashMap<String, Analyse.Score>()
+        var debutDetection = 0L
+        var dernierSon = System.currentTimeMillis()
+        var averti = false
+        var debutPhrase = 0L
+        val hauteurs = ArrayList<Float>()
+        val energies = ArrayList<Float>()
+        var debutVoix = 0L
+        var finVoix = System.currentTimeMillis()
+
+        fun vider() { hauteurs.clear(); energies.clear(); debutPhrase = 0L; debutVoix = 0L }
+        fun fin(json: String) {
+            val (t, conf) = lire(json)
+            val duree = if (debutVoix > 0) System.currentTimeMillis() - debutVoix else 0L
+            traiter(t, conf, Analyse.mediane(hauteurs), Analyse.mediane(energies), duree)
+            vider()
+        }
+        fun finirDetection(code: String) {
+            detection.values.forEach { it.close() }; detection.clear(); scores.clear()
+            aDetecter = false
+            statut("Langue de la vidéo : ${Langues.trouver(code).nom}. Préparation...")
+            principal.post {
+                preparerTraducteur(code) {
+                    source = code
+                    aRemettre = true
+                    statut(if (code == cible) "La vidéo est déjà en ${Langues.trouver(cible).nom} : rien à traduire."
+                           else "Langue détectée : ${Langues.trouver(code).nom}. J'écoute.")
+                }
+            }
+        }
+
+        while (actif) {
+            val n = rec.read(buf, 0, buf.size)
+            if (n <= 0) continue
+            val maintenant = System.currentTimeMillis()
+
+            // Nouvelle vidéo ou « Recommencer » : on oublie tout ce qui était en cours
+            if (aRemettre) {
+                aRemettre = false
+                reco?.close(); reco = null
+                if (!aDetecter) modeles[source]?.let { reco = nouveauReco(it) }
+                vider()
+            }
+            if (aDetecter && detection.isEmpty()) {
+                reco?.close(); reco = null
+                modeles.forEach { (c, m) -> detection[c] = nouveauReco(m); scores[c] = Analyse.Score() }
+                debutDetection = 0L
+            }
+
+            val son = aDuSon(buf, n)
+            if (son) {
+                // Long silence puis du son : probablement une autre vidéo
+                if (maintenant - dernierSon > prefs.getInt("silence_nouvelle", 4) * 1000L) {
+                    nouvelleVideo(redetecter = choixSource == Langues.AUTO && prefs.getBoolean("auto_chaque_video", true))
+                }
+                dernierSon = maintenant
+                if (averti) { averti = false; statut("J'écoute.") }
+            } else if (!averti && maintenant - dernierSon > 20000) {
+                averti = true
+                statut("Aucun son capté depuis 20 s. Vidéo en pause, ou l'app bloque la capture.")
+            }
+
+            // ----- Détection de la langue : toutes les écoutes en parallèle -----
+            if (aDetecter) {
+                if (detection.isEmpty()) continue
+                if (son && debutDetection == 0L) debutDetection = maintenant
+                for ((c, r) in detection) {
+                    if (r.acceptWaveForm(buf, n)) scores[c]?.ajouter(confiances(r.result))
+                }
+                val delai = debutDetection > 0 && maintenant - debutDetection > 15000
+                Analyse.choisirLangue(scores, delai)?.let { finirDetection(it) }
+                continue
+            }
+
+            val r = reco ?: continue
+
+            // Hauteur de la voix (pour choisir voix homme / femme / enfant)
+            Analyse.hauteur(buf, n, TAUX)?.let {
+                if (hauteurs.size < 400) { hauteurs.add(it); energies.add(Analyse.energie(buf, n)) }
+                if (debutVoix == 0L) debutVoix = maintenant
+                finVoix = maintenant
+            }
+
+            if (r.acceptWaveForm(buf, n)) {
+                fin(r.result)
+            } else {
+                // On coupe vite pour coller à la vidéo : trop de mots ou trop longtemps
+                val partiel = texte(r.partialResult, "partial")
+                if (partiel.isEmpty()) continue
+                if (debutPhrase == 0L) debutPhrase = maintenant
+                val mots = partiel.split(" ").size
+                val maxMots = prefs.getInt("mots_max", 10)
+                if (Analyse.couper(mots, maintenant - debutPhrase, maxMots)) {
+                    fin(r.finalResult)
+                    r.reset()
+                }
+            }
+        }
+        reco?.close()
+        detection.values.forEach { it.close() }
+    }
+
+    /** Texte et confiance moyenne d'un résultat Vosk. */
+    private fun lire(json: String): Pair<String, Float> = try {
+        val o = JSONObject(json)
+        o.optString("text").trim() to Analyse.confianceMoyenne(confiances(json))
+    } catch (e: Exception) { "" to -1f }
+
+    private fun confiances(json: String): List<Float> = try {
+        val a = JSONObject(json).optJSONArray("result")
+        if (a == null) emptyList() else (0 until a.length()).map { a.getJSONObject(it).optDouble("conf", 0.0).toFloat() }
+    } catch (e: Exception) { emptyList() }
 
     private fun aDuSon(buf: ByteArray, n: Int): Boolean {
         var i = 0
@@ -271,22 +385,78 @@ class DoublageService : Service() {
     private fun texte(json: String, cle: String): String =
         try { JSONObject(json).optString(cle).trim() } catch (e: Exception) { "" }
 
+    // ---------- Nouvelle vidéo / Recommencer ----------
+
+    /** Appelé du fil d'écoute quand le son revient après un long silence. */
+    private fun nouvelleVideo(redetecter: Boolean) {
+        generation.incrementAndGet()
+        aRemettre = true
+        if (redetecter && modeles.size > 1) aDetecter = true
+        principal.post { viderParole() }
+    }
+
+    /** Bouton « Recommencer » du panneau ⋮ : on jette tout et on repart à zéro. */
+    private fun recommencer(redetecter: Boolean) {
+        generation.incrementAndGet()
+        aRemettre = true
+        if (redetecter && choixSource == Langues.AUTO && modeles.size > 1) {
+            aDetecter = true
+            statut("Je cherche la langue de la nouvelle vidéo...")
+        } else statut("Recommencé. J'écoute.")
+        dOriginal = ""; dTraduction = ""
+        viderParole()
+        f0Base.fill(0f); energieBase.fill(0f); debitBase.fill(0f)
+    }
+
+    private fun viderParole() {
+        file.clear()
+        if (parle) tts?.stop()
+        parle = false
+        idEnCours = null
+        rendreFocus()
+    }
+
     // ---------- Traduction et parole ----------
 
-    private fun traiter(t: String, f0: Float, energie: Float, dureeMs: Long) {
+    private fun traiter(t: String, conf: Float, f0: Float, energie: Float, dureeMs: Long) {
         if (Langues.parasite(source, t)) return
+        // Phrase mal entendue (musique, bruit) : la traduire donnerait n'importe quoi
+        if (Analyse.malEntendue(conf, prefs.getInt("filtre", 45))) {
+            dOriginal = "($t)"
+            signaler()
+            return
+        }
         dOriginal = t
         signaler()
+        val tr = traducteur ?: return
         val mots = t.split(" ").count { it.isNotBlank() }
         val debit = if (dureeMs > 300) mots * 1000f / dureeMs else 0f
+        val gen = generation.get()
+        val t0 = System.currentTimeMillis()
         principal.post {
-            traducteur?.translate(t)?.addOnSuccessListener { tr ->
-                dTraduction = tr
-                notifier(tr)
+            tr.translate(t).addOnSuccessListener { trad ->
+                if (gen != generation.get() || trad.isBlank()) return@addOnSuccessListener
+                dTraduction = trad
+                notifier(trad)
                 signaler()
-                parler(tr, f0, energie, debit)
+                file.addLast(Phrase(trad, f0, energie, debit, t0, gen))
+                // Trop de retard : on garde seulement la dernière phrase
+                while (file.size > 2) file.removeFirst()
+                if (!parle) suivante()
             }
         }
+    }
+
+    /** Dit la phrase suivante de la file, avec les réglages actuels. */
+    private fun suivante() {
+        val retardMax = prefs.getInt("retard_max", 6) * 1000L
+        while (file.isNotEmpty()) {
+            val p = file.removeFirst()
+            if (p.gen != generation.get() || Analyse.perimee(System.currentTimeMillis() - p.t0, retardMax)) continue
+            if (dire(p.texte, p.f0, p.energie, p.debit, enRetard = file.size)) return
+        }
+        parle = false
+        rendreFocus()
     }
 
     private fun genre(f0: Float): Int = Analyse.genre(
@@ -295,12 +465,9 @@ class DoublageService : Service() {
         prefs.getInt("defaut", Analyse.HOMME)
     )
 
-    private fun parler(t: String, f0: Float, energie: Float, debit: Float) {
-        val tt = tts ?: return
-        // Retard : s'il reste déjà 2 phrases à dire, on les saute pour rattraper la vidéo
-        val enRetard = enCours.size >= 2
-        if (enRetard) enCours.clear()
-
+    /** Parle tout de suite (la file est gérée par suivante()). */
+    private fun dire(t: String, f0: Float, energie: Float, debit: Float, enRetard: Int): Boolean {
+        val tt = tts ?: return false
         val g = if (prefs.getBoolean("auto", true)) genre(f0) else prefs.getInt("defaut", Analyse.HOMME)
         val nomVoix = prefs.getString(if (Analyse.base(g) == Analyse.HOMME) "voix_homme_$cible" else "voix_femme_$cible", null)
         val v = tt.voices?.firstOrNull { it.name == nomVoix }
@@ -315,21 +482,30 @@ class DoublageService : Service() {
 
         // Vitesse : réglage de base x émotion + accélération si on prend du retard
         val base = prefs.getFloat("vitesse", 1.2f)
-        tt.setSpeechRate(minOf(base * e[2] * (1f + 0.25f * enCours.size), 2.5f))
-        val h = prefs.getFloat("hauteur", 1.0f)
-        tt.setPitch(h * Analyse.montee(g) * e[1])
+        tt.setSpeechRate(minOf(base * e[2] * (1f + 0.25f * enRetard), 2.5f))
+        tt.setPitch(prefs.getFloat("hauteur", 1.0f) * Analyse.montee(g) * e[1])
 
         val id = "u" + System.nanoTime()
-        enCours.add(id)
         if (baisser) prendreFocus()
         val pct = (prefs.getInt("volume", 100) * e[0]).toInt().coerceIn(10, 300)
         val vol = (volume ?: Volume(this).also { volume = it }).params(pct, compensationMb)
-        tt.speak(t, if (enRetard) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD, vol, id)
+        idEnCours = id
+        parle = true
+        return tt.speak(t, TextToSpeech.QUEUE_FLUSH, vol, id) == TextToSpeech.SUCCESS
+    }
+
+    /** Un curseur du panneau ⋮ vient d'être lâché : on redit la dernière phrase avec le nouveau réglage. */
+    private fun essaiReglage() {
+        val t = dTraduction.ifBlank { if (cible == "ar") "تجربة الصوت" else if (cible == "fr") "Essai de la voix" else "1 2 3" }
+        file.clear()
+        generation.get().let { file.addLast(Phrase(t, 0f, 0f, 0f, System.currentTimeMillis(), it)) }
+        suivante()
     }
 
     private fun finParole(id: String?) {
-        if (id != null) enCours.remove(id)
-        if (enCours.isEmpty()) principal.post { if (enCours.isEmpty()) rendreFocus() }
+        principal.post {
+            if (id != null && id == idEnCours) { idEnCours = null; parle = false; suivante() }
+        }
     }
 
     private fun attributsParole() = AudioAttributes.Builder()
@@ -387,7 +563,7 @@ class DoublageService : Service() {
     }
 
     private fun signaler() {
-        principal.post { ecouteur?.invoke() }
+        principal.post { ecouteur?.invoke(); bulle?.maj(dStatut, dOriginal, dTraduction) }
     }
 
     private fun creerCanal() {
@@ -427,6 +603,7 @@ class DoublageService : Service() {
     }
 
     override fun onDestroy() {
+        prefs.unregisterOnSharedPreferenceChangeListener(changementReglage)
         actif = false
         enMarche = false
         bulle?.cacher()
@@ -440,8 +617,8 @@ class DoublageService : Service() {
         tts?.stop()
         tts?.shutdown()
         volume?.liberer()
-        traducteur?.close()
-        model?.close()
+        traducteurs.values.forEach { it.close() }
+        modeles.values.forEach { it.close() }
         if (::audio.isInitialized) rendreFocus()
         dStatut = "Arrêté."
         signaler()

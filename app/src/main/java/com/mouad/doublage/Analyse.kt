@@ -179,5 +179,41 @@ object Analyse {
 
     /** Faut-il traduire tout de suite la phrase en cours ? */
     fun couper(mots: Int, dureeMs: Long, maxMots: Int): Boolean =
-        mots >= maxMots || (mots >= 3 && dureeMs > 3500)
+        mots >= maxMots || (mots >= 3 && dureeMs > 4500)
+
+    /** Confiance moyenne (0..1) des mots reconnus. -1 si aucun mot. */
+    fun confianceMoyenne(confs: List<Float>): Float =
+        if (confs.isEmpty()) -1f else confs.sum() / confs.size
+
+    /**
+     * Phrase probablement mal entendue (musique, bruit, mauvaise langue) : on ne la traduit pas.
+     * seuil en % (0 = tout garder). Une phrase sans confiance connue (-1) est gardée.
+     */
+    fun malEntendue(confiance: Float, seuil: Int): Boolean =
+        seuil > 0 && confiance >= 0f && confiance * 100f < seuil
+
+    /** Phrase trop vieille pour être dite : la vidéo est déjà ailleurs (autre scène ou autre film). */
+    fun perimee(ageMs: Long, retardMaxMs: Long): Boolean = ageMs > retardMaxMs
+
+    /** Score de détection d'une langue : mots reconnus et leur confiance totale. */
+    class Score { var mots = 0; var conf = 0f
+        fun ajouter(confs: List<Float>) { mots += confs.size; conf += confs.sum() }
+        fun moyenne(): Float = if (mots == 0) 0f else conf / mots
+    }
+
+    /**
+     * Langue de la vidéo d'après les écoutes en parallèle : celle dont les mots sont reconnus
+     * avec la meilleure confiance. null = pas encore assez de paroles pour décider.
+     * fin = true : on décide avec ce qu'on a (délai écoulé).
+     */
+    fun choisirLangue(scores: Map<String, Score>, fin: Boolean): String? {
+        val valides = scores.filter { it.value.mots >= 3 }
+        if (valides.isEmpty()) return if (fin) scores.maxByOrNull { it.value.mots }?.key else null
+        val tries = valides.entries.sortedByDescending { it.value.moyenne() }
+        val premier = tries[0]
+        if (fin || tries.size == 1 && premier.value.mots >= 8) return premier.key
+        if (premier.value.mots < 6) return null
+        val ecart = premier.value.moyenne() - (tries.getOrNull(1)?.value?.moyenne() ?: 0f)
+        return if (ecart >= 0.08f || premier.value.mots >= 15) premier.key else null
+    }
 }

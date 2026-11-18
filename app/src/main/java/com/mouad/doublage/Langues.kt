@@ -8,6 +8,21 @@ object Langues {
     /** Modèle anglais livré dans l'APK : pas de téléchargement. */
     const val VOSK_INCLUS = "en"
 
+    /** Code spécial : l'app trouve elle-même la langue de la vidéo. */
+    const val AUTO = "auto"
+
+    /** Au-delà de cette taille, le modèle est trop lourd pour écouter en parallèle (détection auto). */
+    const val MAX_MO_AUTO = 150
+
+    /** Langues qu'on peut reconnaître en mode automatique. */
+    val detectables get() = sources.filter { it.tailleMo <= MAX_MO_AUTO }
+
+    /** Langues écoutées en mode auto (choisies par l'utilisateur, anglais par défaut + français). */
+    fun choixAuto(s: Set<String>?): List<Langue> {
+        val l = detectables.filter { it.code in (s ?: setOf("en", "fr")) }
+        return l.ifEmpty { detectables.filter { it.code == "en" } }
+    }
+
     /** Toutes les langues que le traducteur ML Kit connaît (traduction dans tous les sens). */
     val toutes = listOf(
         Langue("ar", "Arabe العربية", "vosk-model-ar-mgb2-0.4", 318),
@@ -51,7 +66,8 @@ object Langues {
     /** Langues possibles pour la vidéo originale (il faut un modèle d'écoute). */
     val sources = toutes.filter { it.vosk != null }
 
-    fun trouver(code: String?): Langue = toutes.firstOrNull { it.code == code } ?: toutes[1]
+    fun trouver(code: String?): Langue =
+        if (code == AUTO) Langue(AUTO, "Détection automatique") else toutes.firstOrNull { it.code == code } ?: toutes[1]
 
     /** Étiquette du menu, avec la taille à télécharger la première fois. */
     fun etiquetteSource(l: Langue): String =

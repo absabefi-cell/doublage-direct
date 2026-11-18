@@ -176,4 +176,51 @@ class AnalyseTest {
         assertTrue(Analyse.couper(4, 4000, 8))
         assertTrue(!Analyse.couper(2, 9000, 8))
     }
+
+    // ---------- v7 : phrases mal entendues, phrases périmées, détection de la langue ----------
+
+    @Test fun filtreMalEntendu() {
+        assertTrue(Analyse.malEntendue(0.30f, 45))
+        assertTrue(!Analyse.malEntendue(0.80f, 45))
+        assertTrue(!Analyse.malEntendue(0.30f, 0))      // filtre coupé : tout passe
+        assertTrue(!Analyse.malEntendue(-1f, 45))       // confiance inconnue : on garde
+        assertEquals(0.5f, Analyse.confianceMoyenne(listOf(0.4f, 0.6f)), 1e-4f)
+        assertEquals(-1f, Analyse.confianceMoyenne(emptyList()), 0f)
+    }
+
+    @Test fun phrasePerimee() {
+        assertTrue(Analyse.perimee(7000, 6000))
+        assertTrue(!Analyse.perimee(2000, 6000))
+    }
+
+    private fun score(vararg c: Float) = Analyse.Score().apply { ajouter(c.toList()) }
+
+    @Test fun detectionLangueClaire() {
+        val s = mapOf(
+            "en" to score(0.45f, 0.5f, 0.4f, 0.5f, 0.42f, 0.38f),
+            "fr" to score(0.95f, 0.9f, 0.97f, 0.88f, 0.93f, 1f, 0.91f)
+        )
+        assertEquals("fr", Analyse.choisirLangue(s, fin = false))
+    }
+
+    @Test fun detectionPasAssezDeMots() {
+        val s = mapOf("en" to score(0.9f, 0.8f), "fr" to score(0.5f))
+        assertNull(Analyse.choisirLangue(s, fin = false))
+        assertEquals("en", Analyse.choisirLangue(s, fin = true))
+    }
+
+    @Test fun detectionTropProcheAttend() {
+        val s = mapOf(
+            "en" to score(0.80f, 0.80f, 0.80f, 0.80f, 0.80f, 0.80f),
+            "es" to score(0.78f, 0.78f, 0.78f, 0.78f, 0.78f, 0.78f)
+        )
+        assertNull(Analyse.choisirLangue(s, fin = false))
+        assertEquals("en", Analyse.choisirLangue(s, fin = true))
+    }
+
+    @Test fun languesAuto() {
+        assertEquals(listOf("fr", "en"), Langues.choixAuto(null).map { it.code })
+        assertEquals(listOf("en"), Langues.choixAuto(setOf("zz")).map { it.code })
+        assertTrue(Langues.detectables.none { it.code == "ar" })   // arabe trop lourd pour écouter en parallèle
+    }
 }

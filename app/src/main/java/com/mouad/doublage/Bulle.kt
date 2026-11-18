@@ -85,7 +85,17 @@ class Bulle(service: Context, private val prefs: SharedPreferences, private val 
             text = "Réglages en direct"; textSize = 17f; setTypeface(null, Typeface.BOLD)
             setTextColor(Color.parseColor("#1B7F4B"))
         })
-        Reglages.ajouter(ctx, col, prefs, complet = true, couleurTexte = Color.parseColor("#222222"))
+        // Ce que l'app entend et dit : pour voir si l'erreur vient de l'écoute ou de la traduction
+        lStatut = TextView(ctx).apply { textSize = 12f; setTypeface(null, Typeface.ITALIC); setTextColor(Color.parseColor("#555555")) }
+        lOrig = TextView(ctx).apply { textSize = 13f; setTextColor(Color.parseColor("#222222")) }
+        lTrad = TextView(ctx).apply { textSize = 14f; setTypeface(null, Typeface.BOLD); setTextColor(Color.parseColor("#1B7F4B")) }
+        col.addView(lStatut); col.addView(lOrig); col.addView(lTrad)
+        maj(DoublageService.dStatut, DoublageService.dOriginal, DoublageService.dTraduction)
+        col.addView(Button(ctx).apply {
+            text = "Recommencer (nouvelle vidéo)"
+            setOnClickListener { prefs.edit().putLong("recommencer", System.currentTimeMillis()).apply() }
+        })
+        Reglages.ajouter(ctx, col, prefs, complet = true, couleurTexte = Color.parseColor("#222222"), essai = true)
         val ligne = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL; setPadding(0, dp(10), 0, 0) }
         val lp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         ligne.addView(Button(ctx).apply { text = "Fermer"; setOnClickListener { fermerPanneau() } }, lp)
@@ -112,9 +122,21 @@ class Bulle(service: Context, private val prefs: SharedPreferences, private val 
         try { wm.addView(cadre, p); panneau = cadre } catch (_: Exception) {}
     }
 
+    private var lStatut: TextView? = null
+    private var lOrig: TextView? = null
+    private var lTrad: TextView? = null
+
+    /** Mise à jour en direct du panneau ouvert. */
+    fun maj(statut: String, original: String, traduction: String) {
+        lStatut?.text = statut
+        lOrig?.text = if (original.isBlank()) "" else "Entendu : $original"
+        lTrad?.text = traduction
+    }
+
     private fun fermerPanneau() {
         panneau?.let { try { wm.removeView(it) } catch (_: Exception) {}; fermeA = System.currentTimeMillis() }
         panneau = null
+        lStatut = null; lOrig = null; lTrad = null
     }
 
     fun cacher() {

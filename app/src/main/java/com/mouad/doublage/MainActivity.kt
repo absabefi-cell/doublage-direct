@@ -38,6 +38,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var spFemme: Spinner
     private lateinit var triVoix: TextView
     private lateinit var btBulle: Button
+    private lateinit var btAuto: Button
     private var essai: TextToSpeech? = null
     private var volEssai: Volume? = null
     private var voixToutes: List<Voice> = emptyList()
@@ -105,6 +106,12 @@ class MainActivity : ComponentActivity() {
         titre("Langues")
         col.addView(petit("Langue de la vidéo"))
         spSource = Spinner(this); col.addView(spSource)
+        btAuto = Button(this).apply {
+            setOnClickListener { choisirLanguesAuto() }
+            visibility = if (source() == Langues.AUTO) View.VISIBLE else View.GONE
+        }
+        col.addView(btAuto)
+        majBtAuto()
         col.addView(petit("Langue de la traduction"))
         spCible = Spinner(this); col.addView(spCible)
         lierLangues()
@@ -233,10 +240,15 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun lierLangues() {
-        val src = Langues.sources
-        spSource.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, src.map { Langues.etiquetteSource(it) })
+        // Première ligne : détection automatique, puis les langues
+        val src = listOf(Langues.trouver(Langues.AUTO)) + Langues.sources
+        val noms = listOf("Détection automatique") + Langues.sources.map { Langues.etiquetteSource(it) }
+        spSource.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, noms)
         spSource.setSelection(src.indexOfFirst { it.code == source() }.coerceAtLeast(0))
-        spSource.onItemSelectedListener = choix { prefs.edit().putString("source", src[it].code).apply() }
+        spSource.onItemSelectedListener = choix {
+            prefs.edit().putString("source", src[it].code).apply()
+            btAuto.visibility = if (src[it].code == Langues.AUTO) View.VISIBLE else View.GONE
+        }
 
         val tous = Langues.toutes
         spCible.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, tous.map { it.nom })
@@ -247,6 +259,35 @@ class MainActivity : ComponentActivity() {
                 remplirVoix()
             }
         }
+    }
+
+    private fun languesAuto() = Langues.choixAuto(prefs.getStringSet("auto_langues", null))
+
+    private fun majBtAuto() {
+        btAuto.text = "Langues à reconnaître : " + languesAuto().joinToString { it.nom } + " (changer)"
+    }
+
+    /** Détection automatique : l'utilisateur choisit les langues possibles de ses vidéos (4 au plus). */
+    private fun choisirLanguesAuto() {
+        val l = Langues.detectables
+        val coche = BooleanArray(l.size) { i -> languesAuto().any { it.code == l[i].code } }
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Langues possibles des vidéos (4 au plus)")
+            .setMultiChoiceItems(l.map { Langues.etiquetteSource(it) }.toTypedArray(), coche) { d, i, oui ->
+                if (oui && coche.count { it } > 4) {
+                    coche[i] = false
+                    (d as android.app.AlertDialog).listView.setItemChecked(i, false)
+                    statut.text = "4 langues au plus : chaque langue en plus fait travailler le téléphone."
+                } else coche[i] = oui
+            }
+            .setPositiveButton("OK") { _, _ ->
+                val choix = l.filterIndexed { i, _ -> coche[i] }.map { it.code }.toSet()
+                prefs.edit().putStringSet("auto_langues", choix.ifEmpty { setOf("en") }).apply()
+                majBtAuto()
+                statut.text = "Les langues pas encore téléchargées le seront au prochain Démarrer (garde Internet)."
+            }
+            .setNegativeButton("Annuler", null)
+            .show()
     }
 
     override fun onDestroy() {
