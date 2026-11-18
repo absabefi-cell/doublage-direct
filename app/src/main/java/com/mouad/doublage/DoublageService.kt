@@ -81,10 +81,23 @@ class DoublageService : Service() {
     // File des phrases à dire, gérée par nous (et non par la synthèse) :
     // les réglages sont appliqués au moment de parler, et les phrases trop vieilles sont sautées.
     private class Phrase(val texte: String, val f0: Float, val energie: Float, val debit: Float,
-                         val t0: Long, val gen: Int, val entree: SousTitre.Entree? = null)
+                         val t0: Long, val gen: Int, val entree: SousTitre.Entree? = null,
+                         val vitesseMin: Float = 0f)
     private val file = ArrayDeque<Phrase>()
     private var parle = false
     private var idEnCours: String? = null
+
+    // ----- Sous-titres YouTube (V9) -----
+    private var suivi: SuiviLecteur? = null
+    @Volatile private var repliques: List<Pistes.Replique>? = null
+    @Volatile private var trads: List<String> = emptyList()
+    @Volatile private var origines: List<String>? = null
+    private var prochaine = 0
+    private var dernierePos = -1L
+    private var dernierTic = 0L
+    private val recherche = AtomicInteger(0)
+    // Hauteurs de voix récentes (moment, hauteur, énergie) : pour choisir la voix au début de chaque réplique
+    private val recentes = ArrayDeque<Triple<Long, Float, Float>>()
 
     // Voix normale de chaque personnage (homme, femme, garçon, fille) : pour mesurer les émotions
     private val f0Base = FloatArray(4)
@@ -162,10 +175,15 @@ class DoublageService : Service() {
             })
         }
 
+        demarrerSuivi()
         if (choixSource == Langues.AUTO) {
             chargerModeles(Langues.choixAuto(prefs.getStringSet("auto_langues", null)))
         } else {
-            preparerTraducteur(source) { chargerModeles(listOf(Langues.trouver(source))) }
+            // V9 : on capte le son tout de suite. Avec des sous-titres YouTube, pas besoin d'attendre
+            // le modèle d'écoute ni le traducteur (ils se préparent en parallèle pour le cas sans sous-titres).
+            demarrerCapture()
+            preparerTraducteur(source) {}
+            chargerModeles(listOf(Langues.trouver(source)))
         }
     }
 
@@ -202,9 +220,14 @@ class DoublageService : Service() {
                     }
                     statut("Chargement de l'écoute ${l.nom}...")
                     modeles[l.code] = Model(dossier.absolutePath)
+                    if (l.code == source) aRemettre = true
                 } catch (e: Exception) {
                     statut("Erreur modèle ${l.nom} : ${e.message}. Vérifie Internet et réessaie.")
                 }
+            }
+            if (choixSource != Langues.AUTO) {
+                if (modeles.isNotEmpty() && repliques == null) statut("J'écoute (${Langues.trouver(source).nom}). Lance ta vidéo YouTube.")
+                return@Thread
             }
             if (modeles.isEmpty()) return@Thread
             if (choixSource == Langues.AUTO) {
@@ -250,7 +273,8 @@ class DoublageService : Service() {
         rec.startRecording()
         actif = true
         statut(if (aDetecter) "J'écoute pour trouver la langue de la vidéo (${modeles.keys.joinToString { Langues.trouver(it).nom }})..."
-               else "J'écoute (${Langues.trouver(source).nom}). Lance ta vidéo YouTube.")
+               else if (modeles.containsKey(source)) "J'écoute (${Langues.trouver(source).nom}). Lance ta vidéo YouTube."
+               else dStatut.ifBlank { "Préparation de l'écoute ${Langues.trouver(source).nom}..." })
         if (prefs.getBoolean("bulle", true)) {
             bulle = Bulle(this, prefs) { stopSelf() }.also { it.montrer() }
         }
@@ -341,14 +365,19 @@ class DoublageService : Service() {
                 continue
             }
 
-            val r = reco ?: continue
-
             // Hauteur de la voix (pour choisir voix homme / femme / enfant)
             Analyse.hauteur(buf, n, TAUX)?.let {
-                if (hauteurs.size < 400) { hauteurs.add(it); energies.add(Analyse.energie(buf, n)) }
+                val en = Analyse.energie(buf, n)
+                if (hauteurs.size < 400) { hauteurs.add(it); energies.add(en) }
                 if (debutVoix == 0L) debutVoix = maintenant
                 finVoix = maintenant
+                synchronized(recentes) {
+                    recentes.addLast(Triple(maintenant, it, en))
+                    while (recentes.isNotEmpty() && (recentes.size > 300 || maintenant - recentes.first().first > 4000)) recentes.removeFirst()
+                }
             }
+
+            val r = reco ?: continue
 
             if (r.acceptWaveForm(buf, n)) {
                 fin(r.result)
@@ -429,6 +458,7 @@ class DoublageService : Service() {
 
     private fun traiter(t: String, conf: Float, f0: Float, energie: Float, dureeMs: Long) {
         if (Langues.parasite(source, t)) return
+        if (sousTitresCales()) return
         val entree = SousTitre.Entree(++compteur, t, conf)
         // Phrase mal entendue (musique, bruit) : la traduire donnerait n'importe quoi
         if (Analyse.malEntendue(conf, prefs.getInt("filtre", 30))) {
@@ -470,7 +500,7 @@ class DoublageService : Service() {
             val p = file.removeFirst()
             if (p.gen != generation.get()) { p.entree?.let { etat(it, SousTitre.Etat.NOUVELLE) }; continue }
             if (Analyse.perimee(System.currentTimeMillis() - p.t0, retardMax)) { p.entree?.let { etat(it, SousTitre.Etat.RETARD) }; continue }
-            if (dire(p.texte, p.f0, p.energie, p.debit, enRetard = file.size)) { p.entree?.let { etat(it, SousTitre.Etat.DITE) }; return }
+            if (dire(p.texte, p.f0, p.energie, p.debit, enRetard = file.size, vitesseMin = p.vitesseMin)) { p.entree?.let { etat(it, SousTitre.Etat.DITE) }; return }
             p.entree?.let { etat(it, SousTitre.Etat.ERREUR) }
         }
         parle = false
@@ -484,7 +514,7 @@ class DoublageService : Service() {
     )
 
     /** Parle tout de suite (la file est gérée par suivante()). */
-    private fun dire(t: String, f0: Float, energie: Float, debit: Float, enRetard: Int): Boolean {
+    private fun dire(t: String, f0: Float, energie: Float, debit: Float, enRetard: Int, vitesseMin: Float = 0f): Boolean {
         val tt = tts ?: return false
         val g = if (prefs.getBoolean("auto", true)) genre(f0) else prefs.getInt("defaut", Analyse.HOMME)
         val nomVoix = prefs.getString(if (Analyse.base(g) == Analyse.HOMME) "voix_homme_$cible" else "voix_femme_$cible", null)
@@ -500,7 +530,7 @@ class DoublageService : Service() {
 
         // Vitesse : réglage de base x émotion + accélération si on prend du retard
         val base = prefs.getFloat("vitesse", 1.2f)
-        tt.setSpeechRate(minOf(base * e[2] * (1f + 0.25f * enRetard), 2.5f))
+        tt.setSpeechRate(minOf(maxOf(base * e[2], vitesseMin) * (1f + 0.25f * enRetard), 2.5f))
         tt.setPitch(prefs.getFloat("hauteur", 1.0f) * Analyse.montee(g) * e[1])
 
         val id = "u" + System.nanoTime()
@@ -579,6 +609,116 @@ class DoublageService : Service() {
         compensationMb = 0
     }
 
+    // ---------- Sous-titres YouTube : la traduction calée sur la position de la vidéo ----------
+
+    private fun demarrerSuivi() {
+        if (!prefs.getBoolean("yt_sous_titres", true)) return
+        val s = SuiviLecteur(this, principal) { titre, chaine, duree -> videoChangee(titre, chaine, duree) }
+        if (s.demarrer()) { suivi = s; principal.post(tic) }
+    }
+
+    /** Sous-titres chargés et position de la vidéo connue : c'est eux qui pilotent la traduction. */
+    private fun sousTitresCales(): Boolean = repliques != null && suivi?.position() != null
+
+    private fun videoChangee(titre: String, chaine: String, dureeMs: Long) {
+        val n = recherche.incrementAndGet()
+        repliques = null; origines = null; trads = emptyList()
+        principal.post { viderParole() }
+        statut("Recherche des sous-titres de « $titre »...")
+        Thread {
+            val res = try {
+                val url = YouTubeSousTitres.trouverVideo(titre, chaine, dureeMs)
+                if (url == null) null else YouTubeSousTitres.charger(url, source.ifBlank { null }, cible)
+            } catch (e: Exception) { null }
+            if (n != recherche.get()) return@Thread
+            if (res == null) {
+                statut("Pas de sous-titres pour cette vidéo : j'écoute et je traduis (${Langues.trouver(source.ifBlank { "en" }).nom}).")
+                return@Thread
+            }
+            var lignes = res.repliques.map { it.texte }
+            var orig: List<String>? = null
+            if (res.langue != cible) {
+                statut("Sous-titres trouvés : ${res.description}. Traduction de ${lignes.size} répliques...")
+                val t = traduireTout(res.langue, lignes)
+                if (t == null) {
+                    statut("Sous-titres trouvés mais la traduction a échoué : j'écoute et je traduis.")
+                    return@Thread
+                }
+                orig = lignes; lignes = t
+            }
+            if (n != recherche.get()) return@Thread
+            principal.post {
+                trads = lignes; origines = orig
+                repliques = res.repliques
+                prochaine = Pistes.indexA(res.repliques, suivi?.position() ?: 0L)
+                dernierePos = -1L
+                statut("Sous-titres : ${res.description}. Traduction calée sur la vidéo.")
+            }
+        }.start()
+    }
+
+    /** Traduit toutes les répliques d'un coup (hors du fil principal). null si impossible. */
+    private fun traduireTout(de: String, lignes: List<String>): List<String>? {
+        val a = TranslateLanguage.fromLanguageTag(de) ?: return null
+        val b = TranslateLanguage.fromLanguageTag(cible) ?: return null
+        val t = Translation.getClient(TranslatorOptions.Builder().setSourceLanguage(a).setTargetLanguage(b).build())
+        return try {
+            com.google.android.gms.tasks.Tasks.await(t.downloadModelIfNeeded(DownloadConditions.Builder().build()))
+            lignes.map { com.google.android.gms.tasks.Tasks.await(t.translate(it)) }
+        } catch (_: Exception) { null } finally { t.close() }
+    }
+
+    /** Hauteur et énergie de la voix depuis un moment donné (ou les 1,5 dernières secondes). */
+    private fun voixDepuis(t: Long): Pair<Float, Float> {
+        val l = synchronized(recentes) { recentes.toList() }
+        val maintenant = System.currentTimeMillis()
+        val choix = l.filter { it.first >= t }.takeIf { it.size >= 3 } ?: l.filter { maintenant - it.first <= 1500 }
+        return Analyse.mediane(choix.map { it.second }) to Analyse.mediane(choix.map { it.third })
+    }
+
+    /** Toutes les 100 ms : quelle réplique faut-il dire maintenant ? */
+    private val tic: Runnable = object : Runnable {
+        override fun run() {
+            if (!enMarche) return
+            principal.postDelayed(this, 100)
+            val l = repliques ?: return
+            val s = suivi ?: return
+            val pos = s.position() ?: return
+            val maintenant = System.currentTimeMillis()
+            if (!s.enLecture()) {
+                // Pause : on se tait tout de suite
+                if (parle || file.isNotEmpty()) viderParole()
+                dernierePos = pos; dernierTic = maintenant
+                return
+            }
+            // Saut dans la vidéo (avance, recul) : on repart de la bonne réplique
+            if (dernierePos >= 0 && kotlin.math.abs(pos - (dernierePos + (maintenant - dernierTic))) > 2500) {
+                prochaine = Pistes.indexA(l, pos)
+                viderParole()
+            }
+            dernierePos = pos; dernierTic = maintenant
+            // On attend 250 ms après le début de la réplique pour entendre la voix (homme, femme, enfant)
+            val (dire, suite) = Pistes.aDire(l, prochaine, pos, avance = -250)
+            prochaine = suite
+            for (i in dire) direReplique(l, i, pos, maintenant)
+        }
+    }
+
+    private fun direReplique(l: List<Pistes.Replique>, i: Int, pos: Long, maintenant: Long) {
+        val trad = trads.getOrNull(i)?.takeIf { it.isNotBlank() } ?: return
+        val r = l[i]
+        val (f0, energie) = voixDepuis(maintenant - (pos - r.debut))
+        val orig = origines?.getOrNull(i) ?: "(sous-titres YouTube)"
+        val entree = SousTitre.Entree(++compteur, orig, -1f).also { it.traduction = trad }
+        dOriginal = orig; dTraduction = trad
+        signaler()
+        etat(entree, SousTitre.Etat.A_DIRE)
+        file.addLast(Phrase(trad, f0, energie, 0f, maintenant, generation.get(), entree,
+            Pistes.vitesseMin(trad, r.fin - r.debut)))
+        while (file.size > 2) file.removeFirst().entree?.let { etat(it, SousTitre.Etat.FILE) }
+        if (!parle) suivante()
+    }
+
     // ---------- Sous-titres de contrôle ----------
 
     private fun majSousTitres() {
@@ -649,6 +789,9 @@ class DoublageService : Service() {
 
     override fun onDestroy() {
         prefs.unregisterOnSharedPreferenceChangeListener(changementReglage)
+        principal.removeCallbacks(tic)
+        suivi?.arreter()
+        suivi = null
         actif = false
         enMarche = false
         bulle?.cacher()
