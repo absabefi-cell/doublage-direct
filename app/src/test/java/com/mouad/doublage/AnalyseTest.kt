@@ -173,7 +173,8 @@ class AnalyseTest {
     @Test fun coupure() {
         assertTrue(Analyse.couper(8, 500, 8))
         assertTrue(!Analyse.couper(5, 1000, 8))
-        assertTrue(Analyse.couper(4, 4000, 8))
+        assertTrue(!Analyse.couper(4, 4000, 8))   // v7 : on attend 4,5 s pour des phrases plus complètes
+        assertTrue(Analyse.couper(4, 5000, 8))
         assertTrue(!Analyse.couper(2, 9000, 8))
     }
 
