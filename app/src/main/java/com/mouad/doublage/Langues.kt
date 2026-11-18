@@ -69,6 +69,10 @@ object Langues {
     fun trouver(code: String?): Langue =
         if (code == AUTO) Langue(AUTO, "Détection automatique") else toutes.firstOrNull { it.code == code } ?: toutes[1]
 
+    /** Nom d'une langue, même si elle n'est pas dans la liste. */
+    fun nom(code: String): String = toutes.firstOrNull { it.code == code }?.nom
+        ?: java.util.Locale(code).getDisplayLanguage(java.util.Locale.FRENCH).ifBlank { code }
+
     /** Étiquette du menu, avec la taille à télécharger la première fois. */
     fun etiquetteSource(l: Langue): String =
         if (l.code == VOSK_INCLUS || l.tailleMo == 0) l.nom else "${l.nom} (${l.tailleMo} Mo la 1re fois)"

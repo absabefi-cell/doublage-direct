@@ -27,5 +27,16 @@
             android:name=".DoublageService"
             android:exported="false"
             android:foregroundServiceType="mediaProjection" />
+
+        <!-- V9 : « Accès aux notifications » pour lire le lecteur YouTube (titre, chaîne, position) -->
+        <service
+            android:name=".EcouteNotifications"
+            android:exported="true"
+            android:label="Doublage Direct"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
     </application>
 </manifest>

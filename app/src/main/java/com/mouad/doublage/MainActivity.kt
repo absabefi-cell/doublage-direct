@@ -39,6 +39,12 @@ class MainActivity : ComponentActivity() {
     private lateinit var triVoix: TextView
     private lateinit var btBulle: Button
     private lateinit var btAuto: Button
+    private lateinit var etatLangues: TextView
+    private lateinit var btPreparer: Button
+    private lateinit var btVoix: Button
+    private lateinit var btNotif: Button
+    @Volatile private var preparation = false
+    private var ttsPret = false
     private var essai: TextToSpeech? = null
     private var volEssai: Volume? = null
     private var voixToutes: List<Voice> = emptyList()
@@ -115,6 +121,41 @@ class MainActivity : ComponentActivity() {
         col.addView(petit("Langue de la traduction"))
         spCible = Spinner(this); col.addView(spCible)
         lierLangues()
+
+        // ---------- V9 : tout préparer d'avance (écoute, traduction, voix) ----------
+        etatLangues = TextView(this).apply { textSize = 14f; setPadding(0, dp(8), 0, 0) }
+        col.addView(etatLangues)
+        btPreparer = Button(this).apply {
+            text = "Tout préparer maintenant (une seule fois, garde Internet)"
+            setOnClickListener { toutPreparer() }
+        }
+        col.addView(btPreparer)
+        btVoix = Button(this).apply {
+            setOnClickListener {
+                try { startActivity(Intent(TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA)) }
+                catch (_: Exception) { startActivity(Intent("com.android.settings.TTS_SETTINGS")) }
+            }
+        }
+        col.addView(btVoix)
+
+        // ---------- V9 : sous-titres YouTube ----------
+        titre("Sous-titres YouTube")
+        col.addView(CheckBox(this).apply {
+            text = "Utiliser les sous-titres de la vidéo quand elle en a (texte exact, traduction pile au début de chaque réplique)"
+            isChecked = prefs.getBoolean("yt_sous_titres", true)
+            setOnCheckedChangeListener { _, b -> prefs.edit().putBoolean("yt_sous_titres", b).apply(); majNotif() }
+        })
+        btNotif = Button(this).apply {
+            text = "Autoriser l'accès aux notifications (une seule fois)"
+            setOnClickListener { startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) }
+        }
+        col.addView(btNotif)
+        col.addView(TextView(this).apply {
+            text = "Cet accès sert seulement à lire le lecteur YouTube (titre, chaîne, position), comme les commandes média du téléphone. " +
+                "Si Android affiche « Paramètre restreint » : Paramètres > Applications > Doublage Direct > ⋮ (en haut) > " +
+                "Autoriser les paramètres restreints, puis réessaie."
+            textSize = 12f
+        })
 
         cbBaisser = CheckBox(this).apply {
             text = "Baisser le son de YouTube pendant la traduction"
@@ -230,7 +271,7 @@ class MainActivity : ComponentActivity() {
                 @Deprecated("Deprecated in Java")
                 override fun onError(id: String?) { finTri(id, false) }
             })
-            runOnUiThread { remplirVoix() }
+            runOnUiThread { ttsPret = true; remplirVoix() }
         }
     }
 
@@ -248,6 +289,7 @@ class MainActivity : ComponentActivity() {
         spSource.onItemSelectedListener = choix {
             prefs.edit().putString("source", src[it].code).apply()
             btAuto.visibility = if (src[it].code == Langues.AUTO) View.VISIBLE else View.GONE
+            majPreparation()
         }
 
         val tous = Langues.toutes
@@ -257,6 +299,7 @@ class MainActivity : ComponentActivity() {
             if (tous[it].code != cible()) {
                 prefs.edit().putString("cible", tous[it].code).apply()
                 remplirVoix()
+                majPreparation()
             }
         }
     }
@@ -284,6 +327,7 @@ class MainActivity : ComponentActivity() {
                 val choix = l.filterIndexed { i, _ -> coche[i] }.map { it.code }.toSet()
                 prefs.edit().putStringSet("auto_langues", choix.ifEmpty { setOf("en") }).apply()
                 majBtAuto()
+                majPreparation()
                 statut.text = "Les langues pas encore téléchargées le seront au prochain Démarrer (garde Internet)."
             }
             .setNegativeButton("Annuler", null)
@@ -338,6 +382,7 @@ class MainActivity : ComponentActivity() {
         if (voixToutes.isEmpty()) statut.text =
             "Aucune voix ${Langues.trouver(l).nom} installée : Paramètres > Synthèse vocale > Google > Installer les données vocales."
         lancerTri()
+        majPreparation()
     }
 
     /** La voix choisie est mal classée : on la déplace dans l'autre liste. */
@@ -404,6 +449,85 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // ---------- V9 : préparation des langues ----------
+
+    /** Langues à écouter : celle choisie, ou celles de la détection automatique. */
+    private fun languesEcoute(): List<Langue> =
+        if (source() == Langues.AUTO) languesAuto() else listOf(Langues.trouver(source()))
+
+    private fun ecoutePrete(l: Langue) = l.code == Langues.VOSK_INCLUS || Modeles.pret(this, l) != null
+
+    private fun voixPrete() = voixToutes.isNotEmpty()
+
+    private fun majNotif() {
+        if (!::btNotif.isInitialized) return
+        btNotif.visibility = if (prefs.getBoolean("yt_sous_titres", true) && !SuiviLecteur.autorise(this)) View.VISIBLE else View.GONE
+    }
+
+    /** Affiche ce qui est prêt et ce qui manque (sans rien télécharger). */
+    private fun majPreparation() {
+        if (!::etatLangues.isInitialized || preparation) return
+        val c = cible()
+        val lignes = ArrayList<String>()
+        for (l in languesEcoute()) lignes.add(if (ecoutePrete(l)) "✓ Écoute ${l.nom}" else "✗ Écoute ${l.nom} (${l.tailleMo} Mo à télécharger)")
+        lignes.add(if (voixPrete()) "✓ Voix ${Langues.nom(c)}" else "✗ Voix ${Langues.nom(c)} pas installée")
+        val sources = languesEcoute().map { it.code }.filter { it != c }
+        etatLangues.text = lignes.joinToString("\n") + "\n… Traduction : vérification"
+        btVoix.text = "Installer la voix ${Langues.nom(c)}"
+        btVoix.visibility = if (voixPrete()) View.GONE else View.VISIBLE
+        com.google.mlkit.common.model.RemoteModelManager.getInstance()
+            .getDownloadedModels(com.google.mlkit.nl.translate.TranslateRemoteModel::class.java)
+            .addOnSuccessListener { modeles ->
+                if (preparation) return@addOnSuccessListener
+                val la = modeles.map { it.language }.toSet() + "en"
+                val manque = (sources + c).distinct().filter { it !in la }
+                val tr = if (sources.isEmpty()) "✓ Traduction : rien à traduire"
+                    else if (manque.isEmpty()) "✓ Traduction ${sources.joinToString { Langues.nom(it) }} → ${Langues.nom(c)}"
+                    else "✗ Traduction ${sources.joinToString { Langues.nom(it) }} → ${Langues.nom(c)} (environ ${manque.size * 30} Mo)"
+                etatLangues.text = lignes.joinToString("\n") + "\n" + tr
+                val tout = languesEcoute().all { ecoutePrete(it) } && manque.isEmpty()
+                btPreparer.visibility = if (tout) View.GONE else View.VISIBLE
+            }
+    }
+
+    /** Télécharge d'avance l'écoute et la traduction : au moment de regarder la vidéo, tout part tout de suite. */
+    private fun toutPreparer() {
+        if (preparation) return
+        preparation = true
+        btPreparer.isEnabled = false
+        val c = cible()
+        val langues = languesEcoute()
+        fun dire(t: String) = runOnUiThread { etatLangues.text = t }
+        Thread {
+            var erreur: String? = null
+            for (l in langues) {
+                if (ecoutePrete(l)) continue
+                try {
+                    Modeles.telecharger(this, l) { p -> dire("Écoute ${l.nom} : $p % (${l.tailleMo} Mo)") }
+                } catch (e: Exception) { erreur = "Écoute ${l.nom} : ${e.message}" }
+            }
+            for (de in langues.map { it.code }.filter { it != c }) {
+                val a = com.google.mlkit.nl.translate.TranslateLanguage.fromLanguageTag(de) ?: continue
+                val b = com.google.mlkit.nl.translate.TranslateLanguage.fromLanguageTag(c) ?: continue
+                dire("Traduction ${Langues.nom(de)} → ${Langues.nom(c)} : téléchargement...")
+                val t = com.google.mlkit.nl.translate.Translation.getClient(
+                    com.google.mlkit.nl.translate.TranslatorOptions.Builder().setSourceLanguage(a).setTargetLanguage(b).build())
+                try {
+                    com.google.android.gms.tasks.Tasks.await(
+                        t.downloadModelIfNeeded(com.google.mlkit.common.model.DownloadConditions.Builder().build()))
+                } catch (e: Exception) { erreur = "Traduction : ${e.message}" } finally { t.close() }
+            }
+            runOnUiThread {
+                preparation = false
+                btPreparer.isEnabled = true
+                majPreparation()
+                statut.text = erreur?.let { "Préparation incomplète ($it). Vérifie Internet et réessaie." }
+                    ?: if (voixPrete()) "Tout est prêt. Lance ta vidéo et appuie sur Démarrer."
+                       else "Écoute et traduction prêtes. Il reste à installer la voix ${Langues.nom(c)}."
+            }
+        }.start()
+    }
+
     // ---------- Bouton ⋮ ----------
 
     private fun majBulle() {
@@ -415,6 +539,8 @@ class MainActivity : ComponentActivity() {
         DoublageService.ecouteur = { rafraichir() }
         rafraichir()
         majBulle()
+        majNotif()
+        if (ttsPret) remplirVoix() else majPreparation()
     }
 
     override fun onPause() {

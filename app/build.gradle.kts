@@ -27,6 +27,7 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+        isCoreLibraryDesugaringEnabled = true   // exigé par NewPipeExtractor sous Android 13
     }
     kotlinOptions { jvmTarget = "17" }
 
@@ -42,5 +43,8 @@ dependencies {
     implementation("com.google.mlkit:translate:17.0.3")
     implementation("com.alphacephei:vosk-android:0.3.47@aar")
     implementation("net.java.dev.jna:jna:5.13.0@aar")
+    // V9 : retrouver la vidéo YouTube et ses sous-titres (sans clé ni compte)
+    implementation("com.github.teamnewpipe:NewPipeExtractor:v0.26.5")
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs_nio:2.0.4")
     testImplementation("junit:junit:4.13.2")
 }
