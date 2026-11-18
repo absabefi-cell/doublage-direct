@@ -224,4 +224,44 @@ class AnalyseTest {
         assertEquals(listOf("en"), Langues.choixAuto(setOf("zz")).map { it.code })
         assertTrue(Langues.detectables.none { it.code == "ar" })   // arabe trop lourd pour écouter en parallèle
     }
+
+    // ---------- v8 : pauses du film, sécurité de fin de parole, sous-titres de contrôle ----------
+
+    @Test fun pausesDuFilm() {
+        // Pause de 5 s dans un film : on ne touche à rien (avant : tout était vidé et la langue recherchée)
+        assertEquals(Analyse.SILENCE_RIEN, Analyse.apresSilence(5000, 8, true))
+        // 10 s de silence : nouvelle vidéo, mais on garde la langue
+        assertEquals(Analyse.SILENCE_NOUVELLE, Analyse.apresSilence(10000, 8, true))
+        // 20 s : nouvelle vidéo, on recherche la langue (seulement en mode automatique)
+        assertEquals(Analyse.SILENCE_CHERCHER_LANGUE, Analyse.apresSilence(20000, 8, true))
+        assertEquals(Analyse.SILENCE_NOUVELLE, Analyse.apresSilence(20000, 8, false))
+    }
+
+    @Test fun finDeParoleDeSecours() {
+        val court = Analyse.dureeMaxParole(20, 1.2f)
+        val long = Analyse.dureeMaxParole(200, 1.2f)
+        assertTrue(court in 5000..8000)
+        assertTrue(long > court)
+        assertTrue(Analyse.dureeMaxParole(100, 0.6f) > Analyse.dureeMaxParole(100, 2f))
+    }
+
+    @Test fun sousTitresDeuxLignes() {
+        val e = SousTitre.Entree(1, "where are you going", 0.82f)
+        assertEquals("EN : where are you going  (82 %)", SousTitre.ligneOriginal("en", e))
+        assertEquals("FR : …", SousTitre.ligneTraduction("fr", e))
+        e.traduction = "où vas-tu"; e.etat = SousTitre.Etat.DITE
+        assertEquals("FR : où vas-tu", SousTitre.ligneTraduction("fr", e))
+        assertTrue(!SousTitre.anomalie(e))
+    }
+
+    @Test fun sousTitresAnomalies() {
+        val e = SousTitre.Entree(2, "the sea", 0.2f)
+        e.etat = SousTitre.Etat.FILTREE
+        assertTrue(SousTitre.ligneTraduction("ar", e).startsWith("AR : ✗ mal entendu"))
+        assertTrue(SousTitre.anomalie(e))
+        e.traduction = "البحر"; e.etat = SousTitre.Etat.RETARD
+        assertTrue(SousTitre.ligneTraduction("ar", e).contains("البحر"))
+        assertTrue(SousTitre.ligneTraduction("ar", e).contains("trop de retard"))
+        assertEquals("EN : x", SousTitre.ligneOriginal("en", SousTitre.Entree(3, "x", -1f)))
+    }
 }

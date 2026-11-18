@@ -63,6 +63,9 @@ class DoublageService : Service() {
     @Volatile private var source = "en"     // langue réellement écoutée
     private var cible = "fr"
     private var bulle: Bulle? = null
+    private var sousTitres: SousTitres? = null
+    private var compteur = 0
+    private var affichee: SousTitre.Entree? = null
 
     // Modèles d'écoute chargés (un seul, ou plusieurs en détection automatique)
     private val modeles = ConcurrentHashMap<String, Model>()
@@ -78,7 +81,7 @@ class DoublageService : Service() {
     // File des phrases à dire, gérée par nous (et non par la synthèse) :
     // les réglages sont appliqués au moment de parler, et les phrases trop vieilles sont sautées.
     private class Phrase(val texte: String, val f0: Float, val energie: Float, val debit: Float,
-                         val t0: Long, val gen: Int)
+                         val t0: Long, val gen: Int, val entree: SousTitre.Entree? = null)
     private val file = ArrayDeque<Phrase>()
     private var parle = false
     private var idEnCours: String? = null
@@ -94,6 +97,8 @@ class DoublageService : Service() {
             "volume_original" -> if (indexAvant >= 0) { rendreFocus(); if (parle) prendreFocus() }
             "essai" -> essaiReglage()
             "recommencer" -> recommencer(redetecter = true)
+            "sous_titres" -> majSousTitres()
+            "st_taille", "st_position" -> sousTitres?.reglages()
         }
     }
 
@@ -249,6 +254,7 @@ class DoublageService : Service() {
         if (prefs.getBoolean("bulle", true)) {
             bulle = Bulle(this, prefs) { stopSelf() }.also { it.montrer() }
         }
+        majSousTitres()
         fil = Thread { boucle(rec) }.apply { start() }
     }
 
@@ -310,10 +316,12 @@ class DoublageService : Service() {
 
             val son = aDuSon(buf, n)
             if (son) {
-                // Long silence puis du son : probablement une autre vidéo
-                if (maintenant - dernierSon > prefs.getInt("silence_nouvelle", 4) * 1000L) {
-                    nouvelleVideo(redetecter = choixSource == Langues.AUTO && prefs.getBoolean("auto_chaque_video", true))
-                }
+                // Long silence puis du son : probablement une autre vidéo.
+                // Un film a des pauses : avant, une pause de 4 s vidait tout et relançait la recherche
+                // de la langue (jusqu'à 15 s sans traduction). Maintenant : 8 s pour vider, 15 s pour la langue.
+                val apres = Analyse.apresSilence(maintenant - dernierSon, prefs.getInt("silence_nouvelle", 8),
+                    choixSource == Langues.AUTO && prefs.getBoolean("auto_chaque_video", true))
+                if (apres != Analyse.SILENCE_RIEN) nouvelleVideo(redetecter = apres == Analyse.SILENCE_CHERCHER_LANGUE)
                 dernierSon = maintenant
                 if (averti) { averti = false; statut("J'écoute.") }
             } else if (!averti && maintenant - dernierSon > 20000) {
@@ -409,6 +417,7 @@ class DoublageService : Service() {
     }
 
     private fun viderParole() {
+        file.forEach { p -> p.entree?.let { etat(it, SousTitre.Etat.NOUVELLE) } }
         file.clear()
         if (parle) tts?.stop()
         parle = false
@@ -420,40 +429,49 @@ class DoublageService : Service() {
 
     private fun traiter(t: String, conf: Float, f0: Float, energie: Float, dureeMs: Long) {
         if (Langues.parasite(source, t)) return
+        val entree = SousTitre.Entree(++compteur, t, conf)
         // Phrase mal entendue (musique, bruit) : la traduire donnerait n'importe quoi
-        if (Analyse.malEntendue(conf, prefs.getInt("filtre", 45))) {
+        if (Analyse.malEntendue(conf, prefs.getInt("filtre", 30))) {
             dOriginal = "($t)"
             signaler()
+            etat(entree, SousTitre.Etat.FILTREE)
             return
         }
         dOriginal = t
         signaler()
-        val tr = traducteur ?: return
+        val tr = traducteur
+        if (tr == null) { etat(entree, if (source == cible) SousTitre.Etat.MEME_LANGUE else SousTitre.Etat.ERREUR); return }
+        etat(entree, SousTitre.Etat.TRADUCTION)
         val mots = t.split(" ").count { it.isNotBlank() }
         val debit = if (dureeMs > 300) mots * 1000f / dureeMs else 0f
         val gen = generation.get()
         val t0 = System.currentTimeMillis()
         principal.post {
             tr.translate(t).addOnSuccessListener { trad ->
-                if (gen != generation.get() || trad.isBlank()) return@addOnSuccessListener
+                entree.traduction = trad
+                if (trad.isBlank()) { etat(entree, SousTitre.Etat.ERREUR); return@addOnSuccessListener }
+                if (gen != generation.get()) { etat(entree, SousTitre.Etat.NOUVELLE); return@addOnSuccessListener }
                 dTraduction = trad
                 notifier(trad)
                 signaler()
-                file.addLast(Phrase(trad, f0, energie, debit, t0, gen))
-                // Trop de retard : on garde seulement la dernière phrase
-                while (file.size > 2) file.removeFirst()
+                etat(entree, SousTitre.Etat.A_DIRE)
+                file.addLast(Phrase(trad, f0, energie, debit, t0, gen, entree))
+                // Trop de retard : on garde seulement les 2 dernières phrases
+                while (file.size > 2) file.removeFirst().entree?.let { etat(it, SousTitre.Etat.FILE) }
                 if (!parle) suivante()
-            }
+            }.addOnFailureListener { etat(entree, SousTitre.Etat.ERREUR) }
         }
     }
 
     /** Dit la phrase suivante de la file, avec les réglages actuels. */
     private fun suivante() {
-        val retardMax = prefs.getInt("retard_max", 6) * 1000L
+        val retardMax = prefs.getInt("retard_max", 10) * 1000L
         while (file.isNotEmpty()) {
             val p = file.removeFirst()
-            if (p.gen != generation.get() || Analyse.perimee(System.currentTimeMillis() - p.t0, retardMax)) continue
-            if (dire(p.texte, p.f0, p.energie, p.debit, enRetard = file.size)) return
+            if (p.gen != generation.get()) { p.entree?.let { etat(it, SousTitre.Etat.NOUVELLE) }; continue }
+            if (Analyse.perimee(System.currentTimeMillis() - p.t0, retardMax)) { p.entree?.let { etat(it, SousTitre.Etat.RETARD) }; continue }
+            if (dire(p.texte, p.f0, p.energie, p.debit, enRetard = file.size)) { p.entree?.let { etat(it, SousTitre.Etat.DITE) }; return }
+            p.entree?.let { etat(it, SousTitre.Etat.ERREUR) }
         }
         parle = false
         rendreFocus()
@@ -491,7 +509,12 @@ class DoublageService : Service() {
         val vol = (volume ?: Volume(this).also { volume = it }).params(pct, compensationMb)
         idEnCours = id
         parle = true
-        return tt.speak(t, TextToSpeech.QUEUE_FLUSH, vol, id) == TextToSpeech.SUCCESS
+        val ok = tt.speak(t, TextToSpeech.QUEUE_FLUSH, vol, id) == TextToSpeech.SUCCESS
+        if (!ok) { idEnCours = null; parle = false; return false }
+        // Sécurité : si la synthèse ne signale jamais la fin, on ne reste pas muet (et YouTube pas baissé) pour toujours
+        principal.postDelayed({ if (idEnCours == id) { idEnCours = null; parle = false; suivante() } },
+            Analyse.dureeMaxParole(t.length, base))
+        return true
     }
 
     /** Un curseur du panneau ⋮ vient d'être lâché : on redit la dernière phrase avec le nouveau réglage. */
@@ -521,6 +544,8 @@ class DoublageService : Service() {
 
     private fun prendreFocus() {
         if (indexAvant >= 0) return
+        // Sans amplification possible, baisser le volume média baisserait aussi la traduction
+        if (volume?.amplificationOk == false) return
         val pct = prefs.getInt("volume_original", 40)
         if (pct >= 100) return
         val m = AudioManager.STREAM_MUSIC
@@ -552,6 +577,26 @@ class DoublageService : Service() {
         }
         indexAvant = -1
         compensationMb = 0
+    }
+
+    // ---------- Sous-titres de contrôle ----------
+
+    private fun majSousTitres() {
+        val voulu = prefs.getBoolean("sous_titres", true) && actif
+        if (voulu && sousTitres == null) sousTitres = SousTitres(this, prefs).also { it.montrer() }
+        if (!voulu) { sousTitres?.cacher(); sousTitres = null }
+    }
+
+    /** Change l'état d'une phrase et met les sous-titres à jour (jamais une phrase plus vieille que celle affichée). */
+    private fun etat(e: SousTitre.Entree, nouvel: SousTitre.Etat) {
+        e.etat = nouvel
+        principal.post {
+            val st = sousTitres ?: return@post
+            val a = affichee
+            if (a != null && e.numero < a.numero) return@post
+            affichee = e
+            st.afficher(if (source.isBlank()) "?" else source, cible, e)
+        }
     }
 
     // ---------- Notification et état ----------
@@ -608,6 +653,8 @@ class DoublageService : Service() {
         enMarche = false
         bulle?.cacher()
         bulle = null
+        sousTitres?.cacher()
+        sousTitres = null
         try { record?.stop() } catch (_: Exception) {}
         try { fil?.join(800) } catch (_: Exception) {}
         record?.release()

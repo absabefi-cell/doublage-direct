@@ -195,6 +195,30 @@ object Analyse {
     /** Phrase trop vieille pour être dite : la vidéo est déjà ailleurs (autre scène ou autre film). */
     fun perimee(ageMs: Long, retardMaxMs: Long): Boolean = ageMs > retardMaxMs
 
+    const val SILENCE_RIEN = 0
+    const val SILENCE_NOUVELLE = 1
+    const val SILENCE_CHERCHER_LANGUE = 2
+
+    /** Pause de moins de 15 s : jamais de nouvelle recherche de la langue (un film a des silences). */
+    const val SILENCE_LANGUE_MS = 15000L
+
+    /**
+     * Le son revient après un silence de silenceMs. Un film a des pauses : on ne considère
+     * « nouvelle vidéo » qu'après seuilS secondes, et on ne recherche la langue qu'après 15 s.
+     */
+    fun apresSilence(silenceMs: Long, seuilS: Int, redetecter: Boolean): Int = when {
+        silenceMs <= seuilS * 1000L -> SILENCE_RIEN
+        redetecter && silenceMs > maxOf(seuilS * 1000L, SILENCE_LANGUE_MS) -> SILENCE_CHERCHER_LANGUE
+        else -> SILENCE_NOUVELLE
+    }
+
+    /**
+     * Durée maximale normale d'une phrase dite (ms). Au-delà, la synthèse vocale ne nous a pas
+     * prévenus de la fin : on passe à la suite pour ne pas rester muet.
+     */
+    fun dureeMaxParole(caracteres: Int, vitesse: Float): Long =
+        (caracteres * 110L / vitesse.coerceAtLeast(0.3f)).toLong() + 5000L
+
     /** Score de détection d'une langue : mots reconnus et leur confiance totale. */
     class Score { var mots = 0; var conf = 0f
         fun ajouter(confs: List<Float>) { mots += confs.size; conf += confs.sum() }

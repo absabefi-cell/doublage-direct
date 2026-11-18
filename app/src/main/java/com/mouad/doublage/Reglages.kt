@@ -38,7 +38,7 @@ object Reglages {
                 override fun onStartTrackingTouch(s: SeekBar?) {}
                 override fun onStopTrackingTouch(s: SeekBar?) {
                     // Pendant le doublage : on redit la dernière phrase pour entendre le changement tout de suite
-                    if (essai && cle != "mots_max" && cle != "filtre") prefs.edit().putLong("essai", System.currentTimeMillis()).apply()
+                    if (essai && cle !in setOf("mots_max", "filtre", "st_taille", "st_position")) prefs.edit().putLong("essai", System.currentTimeMillis()).apply()
                 }
             })
             col.addView(sb)
@@ -55,11 +55,19 @@ object Reglages {
         curseur("Force des émotions", "emotions", 0, 100, 60, false) {
             "$it %" + if (it == 0) " (voix neutre)" else ""
         }
+        col.addView(android.widget.CheckBox(ctx).apply {
+            text = "Sous-titres en bas : langue originale + traduction (pour comparer)"
+            isChecked = prefs.getBoolean("sous_titres", true)
+            couleurTexte?.let { setTextColor(it) }
+            setOnCheckedChangeListener { _, b -> prefs.edit().putBoolean("sous_titres", b).apply() }
+        })
+        curseur("Taille des sous-titres", "st_taille", 10, 30, 16, false) { "$it" }
+        curseur("Hauteur des sous-titres (depuis le bas)", "st_position", 0, 85, 6, false) { "$it %" }
         if (complet) {
             curseur("Réactivité (mots max avant de traduire)", "mots_max", 4, 16, 10, false) {
                 "$it mots" + if (it <= 6) " (très rapide, moins de sens)" else if (it >= 12) " (phrases plus complètes)" else ""
             }
-            curseur("Filtre des phrases mal entendues", "filtre", 0, 90, 45, false) {
+            curseur("Filtre des phrases mal entendues", "filtre", 0, 90, 30, false) {
                 if (it == 0) "0 % (tout traduire)" else "$it %" + if (it >= 65) " (strict)" else ""
             }
         }

@@ -13,6 +13,9 @@ class Volume(context: Context) {
         LoudnessEnhancer(session).apply { enabled = true }
     } catch (e: Exception) { null }
 
+    /** L'amplification marche : on peut baisser YouTube sans rendre la traduction trop faible. */
+    val amplificationOk get() = ampli != null
+
     /** Paramètres à passer à tts.speak() pour un volume en pourcentage. */
     fun params(pourcent: Int, compensationMb: Int = 0): Bundle {
         try { ampli?.setTargetGain(Analyse.gainMb(pourcent) + compensationMb) } catch (_: Exception) {}
